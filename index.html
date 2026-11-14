@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="HackTerm">
+  <meta name="theme-color" content="#020a04">
+  <meta name="format-detection" content="telephone=no">
+  <title>HackTerm</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="apple-touch-icon" href="icons/icon-180.png">
+  <link rel="icon" href="icons/icon-192.png">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body data-theme="green">
+  <div id="app">
+    <header id="hud" role="button" aria-label="Aktuelle Mission anzeigen">
+      <div class="logo">HACK<span>TERM</span></div>
+      <div class="hud-mid">
+        <div class="hud-row"><span id="rank">Script Kiddie</span><span id="xp">0 XP</span></div>
+        <div class="bar"><div id="xpbar"></div></div>
+      </div>
+      <div id="mnum" class="hud-mission">01/26</div>
+    </header>
+
+    <main id="term" aria-live="polite">
+      <div id="out"></div>
+      <div id="line"><span id="prompt"></span><input id="cmd" type="text" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" enterkeyhint="go" aria-label="Befehl eingeben"></div>
+    </main>
+
+    <nav id="keys" aria-label="Sondertasten">
+      <button data-k="tab">TAB</button>
+      <button data-k="up">↑</button>
+      <button data-k="down">↓</button>
+      <button data-k="left">←</button>
+      <button data-k="right">→</button>
+      <button data-i="|">|</button>
+      <button data-i=">">&gt;</button>
+      <button data-i="-">-</button>
+      <button data-i="/">/</button>
+      <button data-i="~">~</button>
+      <button data-i="*">*</button>
+      <button data-i="$">$</button>
+      <button data-i="&quot;">"</button>
+      <button data-i="'">'</button>
+      <button data-i="&amp;">&amp;</button>
+      <button data-i=".">.</button>
+      <button data-k="ctrlc">^C</button>
+      <button data-k="ctrll">^L</button>
+    </nav>
+  </div>
+
+  <div id="editor" hidden>
+    <div class="ed-head"><span id="ed-ver">GNU nano 7.2</span><span id="ed-name"></span><span id="ed-mod"></span></div>
+    <textarea id="ed-text" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
+    <div id="ed-msg"></div>
+    <div class="ed-foot" id="ed-foot">
+      <button data-e="save"><b>^O</b> Speichern</button>
+      <button data-e="exit"><b>^X</b> Beenden</button>
+    </div>
+    <div class="ed-foot" id="ed-ask" hidden>
+      <span>Änderungen speichern?</span>
+      <button data-e="yes"><b>J</b> Ja</button>
+      <button data-e="no"><b>N</b> Nein</button>
+      <button data-e="cancel"><b>^C</b> Abbruch</button>
+    </div>
+  </div>
+
+  <canvas id="matrix" hidden></canvas>
+  <div id="banner" hidden></div>
+  <div id="toasts"></div>
+  <div class="crt" aria-hidden="true"></div>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
