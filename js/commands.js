@@ -5,6 +5,8 @@ import { MAN, HOSTS, SITES } from './world.js';
 import { awkRun, calc, AwkError } from './awk.js';
 
 export class Usage extends Error {}
+// Marks an unexpanded array assignment (name=(...)) handed to declare/local/export.
+export const RAW = '\uE00F';
 export const commands = Object.create(null);
 // Shell builtins have no binary in /usr/bin.
 export const BUILTINS = new Set(['cd', 'export', 'unset', 'alias', 'unalias', 'history', 'source', '.', 'exit',
@@ -1513,13 +1515,17 @@ commands.env = commands.printenv = ctx => {
 };
 commands.export = ctx => {
   const sh = ctx.sh;
-  const a = ctx.args.filter(x => x !== '-p');
+  const a = ctx.args.filter(x => x !== '-p' && x !== '-f' && x !== '-n');
   if (!a.length) { for (const k of [...sh.exported].sort()) if (k in sh.env) ctx.out(`declare -x ${k}="${sh.env[k]}"\n`); return; }
-  for (const x of a) {
+  for (let x of a) {
+    const raw = x.startsWith(RAW);
+    if (raw) x = x.slice(1);
     const eq = x.indexOf('=');
     const k = eq < 0 ? x : x.slice(0, eq);
     if (!/^[A-Za-z_]\w*$/.test(k)) { ctx.err(`bash: export: \`${x}': not a valid identifier\n`); ctx.fail = 1; continue; }
-    if (eq >= 0) sh.env[k] = x.slice(eq + 1);
+    if (eq >= 0) {
+      try { sh.assign(k, undefined, false, x.slice(eq + 1), !raw); } catch (e) { ctx.err(`bash: ${e.message}\n`); ctx.fail = 1; continue; }
+    }
     sh.exported.add(k);
   }
 };
@@ -1553,16 +1559,16 @@ commands.exit = commands.logout = ctx => {
   ctx.err('Es gibt kein Entkommen aus HackTerm. ;)\n');
 };
 
-function runFile(ctx, f, args) {
+function runFile(ctx, f, args, child = false) {
   let text;
   try { text = ctx.fs.readFile(ctx.p(f)); } catch (e) { ctx.err(`bash: ${f}: ${e.message}\n`); return 127; }
-  return ctx.sh.runScript(text, [f, ...args], ctx.io);
+  return ctx.sh.runScript(text, [f, ...args], ctx.io, child);
 }
 commands.bash = commands.sh = ctx => {
-  if (ctx.args[0] === '-c' && ctx.args[1] !== undefined) return ctx.sh.runScript(ctx.args[1], ['bash', ...ctx.args.slice(2)], ctx.io);
+  if (ctx.args[0] === '-c' && ctx.args[1] !== undefined) return ctx.sh.runScript(ctx.args[1], ['bash', ...ctx.args.slice(2)], ctx.io, true);
   const f = ctx.args.find(a => !a.startsWith('-'));
   if (!f) { ctx.err('bash: verschachtelte Shells gibt es in der Simulation nicht - nutze "bash script.sh"\n'); return 1; }
-  return runFile(ctx, f, ctx.args.slice(ctx.args.indexOf(f) + 1));
+  return runFile(ctx, f, ctx.args.slice(ctx.args.indexOf(f) + 1), true);
 };
 commands.source = commands['.'] = ctx => {
   if (!ctx.args.length) { ctx.err('bash: source: filename argument required\n'); return 2; }
@@ -1644,6 +1650,7 @@ commands.help = ctx => {
   let s = `${B}HackTerm - Befehlsuebersicht${R}\n`;
   for (const [cat, names] of Object.entries(cats)) s += `\n${B}${cat}${R}\n  ${names.join('  ')}\n`;
   s += `\nDetails: ${ctx.tty ? C.green : ''}man <befehl>${R}   Operatoren: | > >> < && || ; $VAR $(cmd) * ? {a,b}\n`;
+  s += `Variablen: \${v:-std} \${v%.txt} \${v#*/} \${v/alt/neu} \${v^^} \${#v}   Arrays: a=(x y) \${a[1]} \${a[@]} \${#a[@]}\n`;
   ctx.out(s);
 };
 

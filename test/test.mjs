@@ -376,7 +376,7 @@ t('case alt', 'x=a.md; case $x in *.txt|*.md) echo text;; *) echo other;; esac',
 t('case quoted', 'x="*"; case abc in "$x") echo literal;; *) echo glob;; esac', 'glob\n');
 t('function', 'gruss() { echo "Hallo $1 ($#)"; }; gruss Neo Trinity', 'Hallo Neo (2)\n');
 t('function kw', 'function f { echo kw; }; f', 'kw\n');
-t('function type', 'f() { :; }; type f', 'f is a function\n');
+t('function type', 'f() { :; }; type f', 'f is a function\nf () { :; }\n');
 t('local', 'f() { local x=1; echo in$x; }; x=9; f; echo out$x', 'in1\nout9\n');
 t('return', 'f() { return 3; }; f; echo $?', '3\n');
 t('return outside', 'return', /can only `return'/, { err: true, code: 1 });
@@ -457,6 +457,68 @@ t('recursion limit', 'f() { f; }; f', /maximum function nesting level exceeded/,
 }
 t('grep multi -e', 'seq 10 | grep -e 3 -e 8', '3\n8\n');
 t('grep -ie', 'grep -ie neo -e TANK documents/contacts.csv', 'Neo,the_one,Hamburg\nTank,operator,Muenchen\n');
+
+// --- parameter expansion, arrays and the newer builtins ---
+t('trim suffix/prefix', 'f=a.tar.gz; echo ${f%.gz} ${f%%.*} ${f#*.} ${f##*.}', 'a.tar a tar.gz gz\n');
+t('basename/dirname', 'p=/usr/local/bin; echo ${p##*/} ${p%/*}', 'bin /usr/local\n');
+t('substr/case/replace', 'x=hello; echo ${x:1:3} ${x: -2} ${x^^} ${x^} ${x/l/L} ${x//l/L} ${#x}', 'ell lo HELLO Hello heLlo heLLo 5\n');
+t('anchored replace', 's="Hallo Welt"; echo ${s,,} ${s::5} ${s/#H/h} ${s/%t/T}', 'hallo welt Hallo hallo Welt Hallo WelT\n');
+t('defaults', 'echo ${y:=dflt} $y; echo ${z:-n} ${z+set} [${y:+w}]', 'dflt dflt\nn [w]\n');
+t(':? aborts the line', 'echo ${z:?fehlt}; echo nie', 'bash: z: fehlt\n', { err: true, code: 1 });
+t('indirect', 'x=5; echo ${!x-none}; y=x; echo ${!y}', 'none\n5\n');
+t('prefix names', 'MYA=1 MYB=2; echo ${!MY*}', 'MYA MYB\n');
+t('bad substitution', 'echo ${x@@}', 'bash: ${x@@}: bad substitution\n', { err: true });
+t('array basics', 'a=(eins zwei "drei vier"); echo ${#a[@]} ${a[1]} ${a[-1]}; for i in "${a[@]}"; do echo "<$i>"; done', '3 zwei drei vier\n<eins>\n<zwei>\n<drei vier>\n');
+t('array append/sparse', 'a=(1 2 3); a+=(4); a[6]=7; echo ${a[@]} ${#a[@]} ${!a[@]}; unset a[1]; echo ${a[@]}', '1 2 3 4 7 5 0 1 2 3 6\n1 3 4 7\n');
+t('array slice/ops', 'a=(x y z); echo ${a[@]:1} ${a[@]^^} ${a[@]/y/Y} "${a[*]}"', 'y z X Y Z x Y z x y z\n');
+t('array copy', 'a=(x "y z"); b=("${a[@]}"); echo ${#b[@]}', '2\n');
+t('array in subshell', 'a=(1 2); (a+=(3); echo ${#a[@]}); echo ${#a[@]}', '3\n2\n');
+t('declare -i', 'declare -i n=5*4; n+=1; echo $n', '21\n');
+t('declare -p array', 'declare -a l=(a b); declare -p l', 'declare -a l=([0]="a" [1]="b")\n');
+t('declare -F', 'f(){ :;}; declare -F', 'declare -f f\n');
+t('declare -A refused', 'declare -A m', /assoziative Arrays/, { err: true, code: 2 });
+t('readonly', 'readonly K=1; K=2; unset K; echo $K', '1\n');
+t('readonly msg', 'readonly K=1; K=2', 'bash: K: readonly variable\n', { err: true });
+t('local array', 'f() { local -a t=(1 2); echo ${#t[@]}; }; f; echo "[${t[@]}]"', '2\n[]\n');
+t('local int', 'f() { local -i n=$1; n+=1; echo $n; }; f 4; echo "[${n-u}]"', '5\n[u]\n');
+t('local outside func', 'local x=1', 'bash: local: can only be used in a function\n', { err: true, code: 1 });
+t('printf -v', 'printf -v v "%03d" 7; echo $v', '007\n');
+t('set --', 'set -- a b c; echo $# $2; set --; echo $#', '3 b\n0\n');
+t('set -e', 'set -e; echo a; false; echo b', 'a\n');
+t('set -e conditions', 'set -e; if false; then :; fi; false || echo ok; ! true; echo weiter', 'ok\nweiter\n');
+t('pipefail', 'set -o pipefail; false | true; echo $?; set +o pipefail; false | true; echo $?', '1\n0\n');
+t('set -u', 'set -u; echo $nix; echo x', 'bash: nix: unbound variable\n', { err: true });
+t('set -x', 'set -x; echo hi', '+ echo hi\n', { err: true });
+t('set -o list', 'set -o pipefail; set -o | grep pipefail', 'pipefail       \ton\n');
+t('mapfile', "printf 'a\\nb\\nc\\n' | { mapfile -t L; echo ${#L[@]} ${L[2]}; }", '3 c\n');
+t('readarray file', 'readarray -t arr < /etc/passwd; echo ${arr[0]%%:*}', 'root\n');
+t('read -a', 'IFS=: read -a parts <<< "a:b:c"; echo ${parts[2]} ${#parts[@]}', 'c 3\n');
+t('getopts', 'f() { while getopts "vf:" o; do echo "$o ${OPTARG-}"; done; shift $((OPTIND-1)); echo "rest $@"; }; f -v -f log x y', 'v \nf log\nrest x y\n');
+t('getopts bad option', 'f() { getopts "a" o; echo $o; }; f -z', '?\n');
+t('ERR trap', "f() { trap 'echo ERR $?' ERR; false; echo nach; }; f", 'ERR 1\nnach\n');
+t('trap -p', "trap 'echo x' INT; trap -p INT; trap - INT; trap -p", "trap -- 'echo x' INT\n");
+t('EXIT trap in script', `printf '%s\\n' "trap 'echo bye \\$?' EXIT" 'set -e' 'echo start' 'false' 'echo never' > /tmp/s.sh; bash /tmp/s.sh; echo rc=$?; set -o | grep errexit`, 'start\nbye 1\nrc=1\nerrexit        \toff\n');
+t('pushd/popd', 'cd /; pushd /etc >/dev/null; pushd /tmp >/dev/null; dirs; popd >/dev/null; pwd', '/tmp /etc /\n/etc\n');
+t('popd empty', 'popd', 'bash: popd: directory stack empty\n', { err: true, code: 1 });
+t('background + wait', 'false & wait $!; echo $?', '1\n');
+t('background notice', 'true &', /^\[1\] \d+\n$/, { err: true });
+t('jobs', 'true & false & jobs', '[1]-  Done                    true\n[2]+  Exit 1                  false\n');
+t('unset -f', 'f() { :; }; unset -f f; type f', 'bash: type: f: not found\n', { err: true });
+t('declare -f source', 'f() { echo $1; }; declare -f f', 'f () { echo $1; }\n');
+{
+  const sh = mk();
+  exec(sh, 'arr=(a "b c"); readonly RO=1');
+  const back = new Shell(JSON.parse(JSON.stringify(sh.serialize())));
+  back.game = new Game(); back.buf = { out: '', err: '' };
+  back.write = (x, k) => { if (k === 'out') back.buf.out += x; };
+  t('arrays persist', 'echo ${#arr[@]} ${arr[1]}; RO=2; echo $RO', '2 b c\n1\n', { sh: back });
+}
+{
+  const sh = mk();
+  exec(sh, 'meinvar=1; meinfunc() { :; }');
+  const c1 = sh.complete('echo $mei'), c2 = sh.complete('meinf');
+  if (c1.line === 'echo $meinvar ' && c2.line === 'meinfunc ') pass++; else { fail++; console.log('FAIL completion of $VAR / functions', c1, c2); }
+}
 
 // --- persistence round trip ---
 {

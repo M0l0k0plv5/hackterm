@@ -1,6 +1,6 @@
 // Shell interpreter: lexer, parser, expansion and execution on top of the VFS.
 import { VFS, normalize, parentPath, baseName } from './vfs.js';
-import { commands, Usage, BUILTINS, opts } from './commands.js';
+import { commands, Usage, BUILTINS, opts, RAW } from './commands.js';
 import './more.js'; // registers the additional commands
 import { FsError } from './vfs.js';
 import { buildWorld, initialProcs, MAN } from './world.js';
@@ -10,6 +10,8 @@ class SyntaxErr extends Error {}
 // Input that is valid so far but unfinished (open quote, missing `done`, trailing `|` ...).
 class Incomplete extends SyntaxErr {}
 class ExpandErr extends Error {}
+// Expansion errors that abort the whole input line (or script), like ${x:?} and set -u in bash.
+class FatalExpand extends ExpandErr {}
 // Control flow signals. They are not Errors, so generic catch blocks can tell them apart.
 export class Signal { constructor(n = 1) { this.n = n; } }
 class BreakSig extends Signal {}
@@ -43,6 +45,22 @@ function matchParen(src, i) {
   return -1;
 }
 
+// Index of the `}` closing the `{` at i, honouring quotes and nested braces.
+function matchBrace(src, i) {
+  let depth = 0;
+  for (let j = i; j < src.length; j++) {
+    const c = src[j];
+    if (c === '\\') { j++; continue; }
+    if (c === "'") { const k = src.indexOf("'", j + 1); if (k < 0) return -1; j = k; continue; }
+    if (c === '"') { let k = j + 1; while (k < src.length && src[k] !== '"') { if (src[k] === '\\') k++; k++; } j = k; continue; }
+    if (c === '{') depth++;
+    else if (c === '}' && --depth === 0) return j;
+  }
+  return -1;
+}
+
+const ASSIGN_HEAD = /^[A-Za-z_]\w*(\[[^\]]*\])?\+?=$/;
+
 const OPS = /^(2>&1|2>>|2>|&>|&&|\|\||;;|<<<|<<-|<<|>>|>|<|\||;|&|\(|\))/;
 
 // Split source text into raw words (quotes kept), operators, newlines, `((..))`,
@@ -50,8 +68,9 @@ const OPS = /^(2>&1|2>>|2>|&>|&&|\|\||;;|<<<|<<-|<<|>>|>|<|\||;|&|\(|\))/;
 export function lex(src) {
   const toks = [];
   const pendingDocs = [];
-  let w = '', has = false, i = 0;
-  const push = () => { if (has) { toks.push({ t: 'w', v: w }); w = ''; has = false; } };
+  // Tokens carry their source span (s, e) so function bodies and jobs can show their text.
+  let w = '', has = false, i = 0, ws = 0;
+  const push = () => { if (has) { toks.push({ t: 'w', v: w, s: ws, e: i }); w = ''; has = false; } };
   const eof = q => new Incomplete(`unexpected EOF while looking for matching \`${q}'`);
   // Read the bodies of all here-documents opened on the line that just ended.
   const readDocs = () => {
@@ -72,6 +91,7 @@ export function lex(src) {
     pendingDocs.length = 0;
   };
   while (i < src.length) {
+    if (!has) ws = i;
     const c = src[i];
     if (c === '\\') {
       if (src[i + 1] === '\n') { i += 2; continue; } // line continuation
@@ -95,7 +115,7 @@ export function lex(src) {
       w += src.slice(i, j + 1); has = true; i = j + 1; continue;
     }
     if (c === '$' && src[i + 1] === '{') {
-      const j = src.indexOf('}', i + 2);
+      const j = matchBrace(src, i + 1);
       if (j < 0) throw eof('}');
       w += src.slice(i, j + 1); has = true; i = j + 1; continue;
     }
@@ -104,13 +124,13 @@ export function lex(src) {
       if (j < 0) throw eof('`');
       w += src.slice(i, j + 1); has = true; i = j + 1; continue;
     }
-    if (c === '\n') { push(); toks.push({ t: 'o', v: '\n' }); i++; if (pendingDocs.length) readDocs(); continue; }
+    if (c === '\n') { push(); toks.push({ t: 'o', v: '\n', s: i, e: i + 1 }); i++; if (pendingDocs.length) readDocs(); continue; }
     if (c === ' ' || c === '\t' || c === '\r') { push(); i++; continue; }
     if (c === '#' && !has) { while (i < src.length && src[i] !== '\n') i++; continue; }
     if (!has && src.startsWith('((', i)) {
       const j = matchParen(src, i);
       if (j < 0) throw eof('))');
-      if (src[j - 1] === ')' && j - 1 > i + 1) { toks.push({ t: 'arith', v: src.slice(i + 2, j - 1) }); i = j + 1; continue; }
+      if (src[j - 1] === ')' && j - 1 > i + 1) { toks.push({ t: 'arith', v: src.slice(i + 2, j - 1), s: i, e: j + 1 }); i = j + 1; continue; }
     }
     if (!has && src.startsWith('[[', i) && /\s/.test(src[i + 2] ?? '\n')) {
       let j = i + 2, q = null;
@@ -122,14 +142,20 @@ export function lex(src) {
         if (/\s/.test(d) && src.startsWith(']]', j + 1) && !/[^\s;&|)]/.test(src[j + 3] ?? ' ')) break;
       }
       if (j >= src.length) throw eof(']]');
-      toks.push({ t: 'dbr', v: src.slice(i + 2, j) });
+      toks.push({ t: 'dbr', v: src.slice(i + 2, j), s: i, e: j + 3 });
       i = j + 3;
       continue;
+    }
+    // Array assignment: name=( ... ) stays one word.
+    if (c === '(' && has && ASSIGN_HEAD.test(w)) {
+      const j = matchParen(src, i);
+      if (j < 0) throw eof(')');
+      w += src.slice(i, j + 1); i = j + 1; continue;
     }
     const m = OPS.exec(src.slice(i));
     if (m && !(m[1][0] === '2' && has)) {
       push();
-      const tok = { t: 'o', v: m[1] };
+      const tok = { t: 'o', v: m[1], s: i, e: i + m[1].length };
       toks.push(tok);
       i += m[1].length;
       if (tok.v === '<<' || tok.v === '<<-') {
@@ -141,6 +167,7 @@ export function lex(src) {
         tok.hd = { delim: raw.replace(/['"\\]/g, ''), quoted: /['"\\]/.test(raw), strip: tok.v === '<<-', body: null };
         pendingDocs.push(tok.hd);
         i = j;
+        tok.e = j;
       }
       continue;
     }
@@ -156,7 +183,7 @@ const CLOSERS = new Set(['then', 'elif', 'else', 'fi', 'do', 'done', 'esac', '}'
 
 // Recursive-descent parser producing an AST:
 // list -> andor -> pipe -> simple | if | for | cfor | while | case | group | subshell | arith | dbr | funcdef
-export function parse(toks) {
+export function parse(toks, src = '') {
   let i = 0;
   const peek = () => toks[i];
   const isW = (t, v) => !!t && t.t === 'w' && t.v === v;
@@ -183,7 +210,9 @@ export function parse(toks) {
     }
     return { type: 'list', items };
   }
+  const span = (from, node) => { if (src && from) node.src = src.slice(from.s, toks[i - 1].e); return node; };
   function andOr() {
+    const from = peek();
     const first = pipeline();
     const rest = [];
     while (isO(peek(), '&&') || isO(peek(), '||')) {
@@ -191,7 +220,7 @@ export function parse(toks) {
       skipNl();
       rest.push({ op, pipe: pipeline() });
     }
-    return { type: 'andor', first, rest };
+    return span(from, { type: 'andor', first, rest });
   }
   function pipeline() {
     let bang = false;
@@ -234,22 +263,24 @@ export function parse(toks) {
       if (t.v === 'case') return redirs(caseCmd());
       if (t.v === '{') { i++; const body = need(list(['}'])); expectW('}'); return redirs({ type: 'group', body, redirs: [] }); }
       if (t.v === 'function') {
+        const from = t;
         i++;
         const n = peek();
         if (!n || n.t !== 'w') throw unexpected(n);
         i++;
         if (isO(peek(), '(')) { i++; if (!isO(peek(), ')')) throw unexpected(peek()); i++; }
-        return funcBody(n.v);
+        return funcBody(n.v, from);
       }
-      if (isO(toks[i + 1], '(') && isO(toks[i + 2], ')')) { i += 3; return funcBody(t.v); }
+      if (isO(toks[i + 1], '(') && isO(toks[i + 2], ')')) { i += 3; return funcBody(t.v, t); }
     }
     return simple();
   }
-  function funcBody(name) {
+  function funcBody(name, from) {
     if (!/^[^\s'"\\$`/=]+$/.test(name) || /^\d+$/.test(name)) throw new SyntaxErr(`\`${name}': not a valid identifier`);
     skipNl();
     const body = command();
     if (body.type === 'simple') throw new SyntaxErr(`syntax error near unexpected token \`${body.words[0] ?? 'newline'}'`);
+    span(from, body);
     return { type: 'funcdef', name, body };
   }
   function simple() {
@@ -389,12 +420,13 @@ function braceExpand(s) {
   return parts.flatMap(p => braceExpand(pre + p + post));
 }
 
-function segRe(seg) {
-  let re = '^';
+// Regex source for a glob with expansion placeholders; quoted parts are already literal.
+function globSource(seg, lazy = false) {
+  let re = '';
   for (let i = 0; i < seg.length; i++) {
     const c = seg[i];
-    if (c === P['*']) re += '.*';
-    else if (c === P['?']) re += '.';
+    if (c === P['*']) re += lazy ? '[\\s\\S]*?' : '[\\s\\S]*';
+    else if (c === P['?']) re += '[\\s\\S]';
     else if (c === P['[']) {
       const j = seg.indexOf(']', i + 2);
       if (j < 0) re += '\\[';
@@ -406,8 +438,38 @@ function segRe(seg) {
       }
     } else re += restore(c).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   }
-  return new RegExp(re + '$');
+  return re;
 }
+function segRe(seg) { return new RegExp('^(?:' + globSource(seg) + ')$'); }
+
+// ${x#p} ${x##p} ${x%p} ${x%%p}: remove the shortest/longest matching prefix/suffix.
+function trimPattern(s, pat, op) {
+  if (op === '#' || op === '##') {
+    const m = new RegExp('^(?:' + globSource(pat, op === '#') + ')').exec(s);
+    return m ? s.slice(m[0].length) : s;
+  }
+  const full = new RegExp('^(?:' + globSource(pat) + ')$');
+  if (op === '%%') { const m = new RegExp('(?:' + globSource(pat) + ')$').exec(s); return m ? s.slice(0, m.index) : s; }
+  for (let k = s.length; k >= 0; k--) if (full.test(s.slice(k))) return s.slice(0, k);
+  return s;
+}
+
+// ${x/p/r} first match, ${x//p/r} all, ${x/#p/r} prefix, ${x/%p/r} suffix (longest matches).
+function replacePattern(s, pat, rep, mode) {
+  const src = globSource(pat);
+  if (mode === '#') return s.replace(new RegExp('^(?:' + src + ')'), () => rep);
+  if (mode === '%') return s.replace(new RegExp('(?:' + src + ')$'), () => rep);
+  if (!pat) return s;
+  return s.replace(new RegExp(src, mode === '/' ? 'g' : ''), m => (m ? rep : ''));
+}
+
+const SHELL_DEFAULTS = Object.assign(Object.create(null), {
+  BASH: '/bin/bash', BASH_VERSION: '5.2.21(1)-release', OSTYPE: 'linux-gnu', PPID: '2047',
+  SHLVL: '1', IFS: ' \t\n', HISTSIZE: '500', OPTIND: '1',
+});
+const ASSIGN = /^([A-Za-z_]\w*)(?:\[([^\]]*)\])?(\+?)=([\s\S]*)$/;
+// Builtins whose name=value arguments are assignments (no word splitting, arrays allowed).
+const DECL = new Set(['declare', 'typeset', 'local', 'readonly', 'export']);
 
 export class Shell {
   constructor(saved) {
@@ -429,6 +491,18 @@ export class Shell {
     this.nextPid = s.nextPid || 2100;
     this.flags = dict(s.flags || {});
     this.funcs = dict(s.funcs || {});
+    this.arrays = dict(s.arrays || {}); // indexed arrays: name -> [values] (holes are null)
+    this.readonly = new Set(s.attrs?.readonly || []);
+    this.intVars = new Set(s.attrs?.int || []);
+    this.opts = { errexit: false, nounset: false, xtrace: false, pipefail: false };
+    this.traps = Object.create(null);
+    this.dirStack = [];
+    this.jobs = []; // finished background jobs not yet reported
+    this.jobCodes = new Map();
+    this.runId = 0;
+    this.condDepth = 0; // >0 while evaluating a condition (no errexit / ERR trap)
+    this.started = Date.now();
+    this.getopt = { ind: 1, sub: 1 };
     this.pending = null; // unfinished multi-line input
     this.loopDepth = 0;
     this.funcDepth = 0;
@@ -460,6 +534,7 @@ export class Shell {
       root: this.fs.root, cwd: this.cwd, env: this.env, exported: [...this.exported],
       aliases: this.aliases, history: this.history.slice(-500), procs: this.procs,
       nextPid: this.nextPid, flags: this.flags, umask: this.fs.umask, funcs: this.funcs,
+      arrays: this.arrays, attrs: { readonly: [...this.readonly], int: [...this.intVars] },
     };
   }
 
@@ -471,15 +546,189 @@ export class Shell {
     return `\x1b[1;32m${this.fs.user}@box\x1b[0m:\x1b[1;34m${p}\x1b[0m$ `;
   }
 
+  // Value of a parameter, or undefined if it is not set.
+  param(k) {
+    switch (k) {
+      case '?': return String(this.lastCode);
+      case '$': case 'BASHPID': return '2048';
+      case '#': return String(this.argv.length - 1);
+      case '@': case '*': return this.argv.slice(1).join(' ');
+      case '!': return this.lastBg === undefined ? undefined : String(this.lastBg);
+      case '-': return 'hB' + (this.opts.errexit ? 'e' : '') + (this.opts.nounset ? 'u' : '') + (this.opts.xtrace ? 'x' : '');
+      case 'PWD': return this.cwd;
+      case 'RANDOM': return String(Math.floor(Math.random() * 32768));
+      case 'SECONDS': return String(Math.floor((Date.now() - this.started) / 1000));
+      case 'UID': case 'EUID': return this.fs.user === 'root' ? '0' : '1000';
+    }
+    if (/^\d+$/.test(k)) return this.argv[+k];
+    if (Object.hasOwn(this.arrays, k)) return this.arrays[k][0] ?? undefined;
+    if (Object.hasOwn(this.env, k)) return this.env[k];
+    return SHELL_DEFAULTS[k];
+  }
+
   getVar(k) {
-    if (k === '?') return String(this.lastCode);
-    if (k === '$') return '2048';
-    if (k === '#') return String(this.argv.length - 1);
-    if (k === '@' || k === '*') return this.argv.slice(1).join(' ');
-    if (/^\d$/.test(k)) return this.argv[+k] ?? '';
-    if (k === 'PWD') return this.cwd;
-    if (k === 'RANDOM') return String(Math.floor(Math.random() * 32768));
-    return this.env[k] ?? '';
+    const v = this.param(k);
+    if (v === undefined && this.opts.nounset && k !== '@' && k !== '*') throw new FatalExpand(`${k}: unbound variable`);
+    return v ?? '';
+  }
+
+  arrayItems(name) {
+    if (Object.hasOwn(this.arrays, name)) return this.arrays[name].filter(v => v !== undefined && v !== null);
+    const v = this.param(name);
+    return v === undefined ? [] : [v];
+  }
+
+  arrayIndex(name, raw) {
+    const len = Object.hasOwn(this.arrays, name) ? this.arrays[name].length : 1;
+    let k = parseInt(this.arith(raw || '0'), 10) || 0;
+    if (k < 0) k += len;
+    if (k < 0) throw new FatalExpand(`${name}[${raw}]: bad array subscript`);
+    return k;
+  }
+
+  // name or name[idx]; idx @ or * joins all elements.
+  paramAt(name, idx) {
+    if (idx === undefined) return name === '@' || name === '*' ? (this.argv.length > 1 ? this.argv.slice(1).join(' ') : undefined) : this.param(name);
+    if (!/^[A-Za-z_]\w*$/.test(name)) throw new FatalExpand(`${name}[${idx}]: bad substitution`);
+    if (idx === '@' || idx === '*') { const it = this.arrayItems(name); return it.length ? it.join(' ') : undefined; }
+    const k = this.arrayIndex(name, idx);
+    if (Object.hasOwn(this.arrays, name)) return this.arrays[name][k] ?? undefined;
+    return k === 0 ? this.param(name) : undefined;
+  }
+
+  listAt(name, idx) {
+    if (name === '@' || name === '*') return this.argv.slice(1);
+    return this.arrayItems(name);
+  }
+
+  // Everything inside ${...}.
+  paramExpand(body) {
+    let m;
+    if (body === '#') return String(this.argv.length - 1);
+    if ((m = /^#([A-Za-z_]\w*|\d+|[@*])(?:\[([^\]]*)\])?$/.exec(body))) {
+      const [, n, idx] = m;
+      if (n === '@' || n === '*') return String(this.argv.length - 1);
+      if (idx === '@' || idx === '*') return String(this.arrayItems(n).length);
+      const v = this.paramAt(n, idx);
+      if (v === undefined && this.opts.nounset) throw new FatalExpand(`${n}: unbound variable`);
+      return String([...(v ?? '')].length);
+    }
+    if ((m = /^!([A-Za-z_]\w*)\[[@*]\]$/.exec(body))) {
+      const arr = Object.hasOwn(this.arrays, m[1]) ? this.arrays[m[1]] : this.arrayItems(m[1]);
+      return arr.map((v, k) => (v === undefined || v === null ? null : k)).filter(k => k !== null).join(' ');
+    }
+    if ((m = /^!([A-Za-z_]\w*)[@*]$/.exec(body))) {
+      // ${!prefix*}: names of all variables starting with prefix.
+      return [...new Set([...Object.keys(this.env), ...Object.keys(this.arrays)])].filter(k => k.startsWith(m[1])).sort().join(' ');
+    }
+    if ((m = /^!([A-Za-z_]\w*|\d+)((?![\[])[\s\S]*)$/.exec(body))) {
+      const ref = this.param(m[1]) ?? '';
+      if (!/^([A-Za-z_]\w*(\[[^\]]*\])?|\d+|[@*#?])$/.test(ref)) throw new FatalExpand(`${ref}: invalid indirect expansion`);
+      return this.paramExpand(ref + m[2]);
+    }
+    m = /^([A-Za-z_]\w*|\d+|[?$#@*!-])(?:\[([^\]]*)\])?([\s\S]*)$/.exec(body);
+    if (!m) throw new FatalExpand(`\${${body}}: bad substitution`);
+    const [, name, idx, op] = m;
+    const many = idx === '@' || idx === '*' || name === '@' || name === '*';
+    const val = this.paramAt(name, idx);
+    const unbound = () => { if (val === undefined && this.opts.nounset && !many) throw new FatalExpand(`${name}: unbound variable`); };
+    if (!op) { unbound(); return val ?? ''; }
+    let r;
+    if ((r = /^(:?)([-=?+])([\s\S]*)$/.exec(op))) {
+      const [, colon, kind, wordRaw] = r;
+      const empty = val === undefined || (colon && val === '');
+      const word = () => this.expand(wordRaw, false)[0] ?? '';
+      if (kind === '-') return empty ? word() : val;
+      if (kind === '+') return empty ? '' : word();
+      if (kind === '?') {
+        if (empty) throw new FatalExpand(`${name}: ${wordRaw ? word() : 'parameter null or not set'}`);
+        return val;
+      }
+      if (!empty) return val;
+      if (!/^[A-Za-z_]\w*$/.test(name)) throw new FatalExpand(`$${name}: cannot assign in this way`);
+      const w = word();
+      this.assign(name, idx, false, w, true);
+      return w;
+    }
+    unbound();
+    const items = many ? this.listAt(name, idx) : [val ?? ''];
+    const each = f => items.map(f).join(' ');
+    if ((r = /^(##?|%%?)([\s\S]*)$/.exec(op))) {
+      const pat = this.expand(r[2], false, true)[0] ?? '';
+      return each(x => trimPattern(x, pat, r[1]));
+    }
+    if ((r = /^\/([/#%]?)((?:\\.|[^/])*)(?:\/([\s\S]*))?$/.exec(op))) {
+      const pat = this.expand(r[2], false, true)[0] ?? '';
+      const rep = r[3] === undefined ? '' : this.expand(r[3], false)[0] ?? '';
+      return each(x => replacePattern(x, pat, rep, r[1]));
+    }
+    if ((r = /^(\^\^?|,,?)$/.exec(op))) {
+      const up = r[1][0] === '^', whole = r[1].length === 2;
+      return each(x => (whole ? (up ? x.toUpperCase() : x.toLowerCase())
+        : x ? (up ? x[0].toUpperCase() : x[0].toLowerCase()) + x.slice(1) : x));
+    }
+    if ((r = /^:([^:]*)(?::([\s\S]*))?$/.exec(op))) {
+      const off = parseInt(this.arith(r[1].trim() || '0'), 10) || 0;
+      const len = r[2] === undefined ? undefined : parseInt(this.arith(r[2].trim() || '0'), 10) || 0;
+      const list = many ? items : [...(val ?? '')];
+      const a = off < 0 ? Math.max(0, list.length + off) : Math.min(off, list.length);
+      let b = len === undefined ? list.length : len < 0 ? list.length + len : a + len;
+      if (b < a) { if (len < 0) throw new FatalExpand(`${len}: substring expression < 0`); b = a; }
+      return list.slice(a, b).join(many ? ' ' : '');
+    }
+    throw new FatalExpand(`\${${body}}: bad substitution`);
+  }
+
+  // Assign name[idx](+)=value. A raw value "(a b c)" assigns an array; preExpanded values are taken literally.
+  assign(name, idx, append, value, preExpanded = false) {
+    if (this.readonly.has(name)) throw new ExpandErr(`${name}: readonly variable`);
+    if (idx === undefined && !preExpanded && /^\([\s\S]*\)$/.test(value)) {
+      const items = lex(value.slice(1, -1)).filter(t => t.t === 'w').flatMap(t => this.expand(t.v));
+      if (items.length > MAX_WORDS) throw new ExpandErr(`${name}: array too large (max ${MAX_WORDS})`);
+      const all = append ? [...(Object.hasOwn(this.arrays, name) ? this.arrays[name] : this.arrayItems(name)), ...items] : items;
+      if (all.length > MAX_WORDS) throw new ExpandErr(`${name}: array too large (max ${MAX_WORDS})`);
+      this.arrays[name] = all;
+      delete this.env[name];
+      return;
+    }
+    let v = preExpanded ? value : (this.expand(value, false)[0] ?? '');
+    const int = this.intVars.has(name);
+    if (int) v = this.arith(append ? `(${this.paramAt(name, idx) || 0})+(${v || 0})` : v || '0');
+    const join = old => (append && !int ? (old ?? '') + v : v);
+    if (idx !== undefined) {
+      if (!Object.hasOwn(this.arrays, name)) {
+        this.arrays[name] = Object.hasOwn(this.env, name) ? [this.env[name]] : [];
+        delete this.env[name];
+      }
+      const k = this.arrayIndex(name, idx);
+      if (k >= MAX_WORDS) throw new ExpandErr(`${name}[${idx}]: index too large for this simulator (max ${MAX_WORDS - 1})`);
+      this.arrays[name][k] = join(this.arrays[name][k]);
+      return;
+    }
+    if (Object.hasOwn(this.arrays, name)) { this.arrays[name][0] = join(this.arrays[name][0]); return; }
+    this.env[name] = join(this.env[name]);
+  }
+
+  expandError(e, io, prefix = '') {
+    io.err(`bash: ${prefix}${e.message}\n`);
+    if (e instanceof FatalExpand) { this.exiting = true; this.lastCode = 1; }
+    return 1;
+  }
+
+  // Plain scalar assignment from builtins (read, for, getopts ...): honours readonly, arrays and -i.
+  setVar(name, v) { this.assign(name, undefined, false, v, true); }
+
+  // Remember a variable's state so the current function can restore it (local / declare).
+  saveLocal(k) {
+    const frame = this.frames[this.frames.length - 1];
+    if (!frame || Object.hasOwn(frame, k)) return;
+    frame[k] = {
+      env: Object.hasOwn(this.env, k) ? this.env[k] : undefined,
+      arr: Object.hasOwn(this.arrays, k) ? this.arrays[k] : undefined,
+      int: this.intVars.has(k), ro: this.readonly.has(k),
+    };
+    delete this.arrays[k];
+    this.readonly.delete(k);
   }
 
   arith(expr) {
@@ -527,15 +776,11 @@ export class Shell {
       return [this.capture(inner), j + 1];
     }
     if (n === '{') {
-      const j = raw.indexOf('}', i + 2);
+      const j = matchBrace(raw, i + 1);
       if (j < 0) return ['$', i + 1];
-      const body = raw.slice(i + 2, j);
-      let m;
-      if ((m = /^#(\w+)$/.exec(body))) return [String(this.getVar(m[1]).length), j + 1];
-      if ((m = /^(\w+):-(.*)$/.exec(body))) return [this.getVar(m[1]) || m[2], j + 1];
-      return [this.getVar(body), j + 1];
+      return [this.paramExpand(raw.slice(i + 2, j)), j + 1];
     }
-    const m = /^([A-Za-z_]\w*|[?$#@*0-9])/.exec(raw.slice(i + 1));
+    const m = /^([A-Za-z_]\w*|[?$#@*!0-9-])/.exec(raw.slice(i + 1));
     if (!m) return ['$', i + 1];
     return [this.getVar(m[1]), i + 1 + m[1].length];
   }
@@ -543,8 +788,9 @@ export class Shell {
   // Expand one raw word into zero or more fields.
   // keepGlob returns the unsplit word with glob placeholders intact (for patterns).
   expand(raw, split = true, keepGlob = false) {
-    // "$@" with no positional parameters expands to no word at all.
-    if (split && (raw === '"$@"' || raw === '"${@}"') && this.argv.length <= 1) return [];
+    // "$@" / "${arr[@]}" with no elements expands to no word at all.
+    let mm;
+    if (split && (mm = /^"\$(?:@|\{@\}|\{([A-Za-z_]\w*)\[@\]\})"$/.exec(raw)) && !this.listAt(mm[1] ?? '@').length) return [];
     const fields = [];
     let cur = '', has = false;
     const unquoted = txt => {
@@ -567,10 +813,10 @@ export class Shell {
         while (i < raw.length && raw[i] !== '"') {
           const q = raw[i];
           if (q === '\\' && '"\\$`'.includes(raw[i + 1])) { cur += raw[i + 1]; i += 2; }
-          else if (split && q === '$' && (raw.startsWith('$@', i) || raw.startsWith('${@}', i))) {
-            // "$@" keeps every positional parameter as its own word.
-            this.argv.slice(1).forEach((a, k) => { if (k > 0) { fields.push(cur); cur = ''; } cur += a; });
-            i += raw.startsWith('$@', i) ? 2 : 4;
+          else if (split && q === '$' && (mm = /^\$(?:@|\{@\}|\{([A-Za-z_]\w*)\[@\]\})/.exec(raw.slice(i)))) {
+            // "$@" and "${arr[@]}" keep every element as its own word.
+            this.listAt(mm[1] ?? '@').forEach((a, k) => { if (k > 0) { fields.push(cur); cur = ''; } cur += a; });
+            i += mm[0].length;
           }
           else if (q === '$') { const [t, n] = this.dollar(raw, i); cur += t; i = n; }
           else if (q === '`') { const j = raw.indexOf('`', i + 1); cur += this.capture(raw.slice(i + 1, j)); i = j + 1; }
@@ -640,7 +886,7 @@ export class Shell {
     }
     const src = this.pending !== null ? this.pending + '\n' + line : line;
     let tree;
-    try { tree = parse(lex(src)); } catch (e) {
+    try { tree = parse(lex(src), src); } catch (e) {
       if (!(e instanceof SyntaxErr)) throw e;
       if (e instanceof Incomplete && src.trim()) {
         this.pending = src;
@@ -654,6 +900,7 @@ export class Shell {
     }
     this.pending = null;
     this.pushHistory(src);
+    this.runId++;
     this.budget = { steps: 0, loops: 0, t0: Date.now() };
     let code;
     try { code = this.exec(tree, io); } catch (sig) {
@@ -668,13 +915,27 @@ export class Shell {
     }
     this.exiting = false;
     this.lastCode = code;
+    this.reportJobs(io, j => j.born < this.runId);
     return { line: src, code, cmds: this.cmdLog, stdout: stdout.replace(/\x1b\[[\d;]*m/g, '') };
+  }
+
+  // "[1]+  Done   cmd" lines for finished background jobs (the shell prints them before a prompt).
+  reportJobs(io, which = () => true, withPid = false, write = io.err) {
+    const due = this.jobs.filter(which);
+    if (!due.length) return [];
+    this.jobs = this.jobs.filter(j => !due.includes(j));
+    due.forEach((j, k) => {
+      const mark = k === due.length - 1 ? '+' : k === due.length - 2 ? '-' : ' ';
+      const status = j.code ? `Exit ${j.code}` : 'Done';
+      write(`[${j.n}]${mark}  ${withPid ? j.pid + ' ' : ''}${status.padEnd(24)}${j.cmd}\n`);
+    });
+    return due;
   }
 
   // Parse and run source text (used by $(...)); syntax errors are reported, not thrown.
   runLine(src, io) {
     let tree;
-    try { tree = parse(lex(src)); } catch (e) {
+    try { tree = parse(lex(src), src); } catch (e) {
       if (!(e instanceof SyntaxErr)) throw e;
       io.err(`bash: ${e.message}\n`);
       return (this.lastCode = 2);
@@ -699,24 +960,58 @@ export class Shell {
     if (node.type === 'list') {
       let code = 0;
       for (const it of node.items) {
-        code = this.exec(it.node, io);
+        code = it.bg ? this.runBackground(it.node, io) : this.exec(it.node, io);
         if (this.exiting) break;
       }
       return code;
     }
     if (node.type === 'andor') {
-      let code = (this.lastCode = this.runPipe(node.first, io));
-      for (const r of node.rest) {
-        if (this.exiting) break;
-        if ((r.op === '&&') === (code === 0)) code = this.lastCode = this.runPipe(r.pipe, io);
-      }
+      // Only the last pipeline of an && / || chain can trigger set -e or the ERR trap.
+      const n = node.rest.length;
+      const cond = fn => { this.condDepth++; try { return fn(); } finally { this.condDepth--; } };
+      let last = node.first;
+      let code = (this.lastCode = n ? cond(() => this.runPipe(node.first, io)) : this.runPipe(node.first, io));
+      let lastRan = n === 0;
+      node.rest.forEach((r, k) => {
+        if (this.exiting || (r.op === '&&') !== (code === 0)) return;
+        const isLast = k === n - 1;
+        last = r.pipe;
+        code = this.lastCode = isLast ? this.runPipe(r.pipe, io) : cond(() => this.runPipe(r.pipe, io));
+        lastRan = isLast;
+      });
+      if (code !== 0 && lastRan && !last.bang && !this.condDepth && !this.exiting) this.onError(code, io);
       return code;
     }
     return this.runCommand(node, io);
   }
 
+  onError(code, io) {
+    if (this.traps.ERR && !this.inTrap) {
+      this.inTrap = true;
+      try { this.runLine(this.traps.ERR, io); } finally { this.inTrap = false; }
+      this.lastCode = code;
+    }
+    if (this.opts.errexit) { this.exiting = true; this.lastCode = code; }
+  }
+
+  // Background jobs finish immediately in the simulator; we keep their status for wait/jobs.
+  runBackground(node, io) {
+    const pid = this.nextPid++;
+    const n = Math.max(0, ...this.jobs.map(j => j.n)) + 1;
+    const top = this.depth === 0 && this.funcDepth === 0;
+    if (top) io.err(`[${n}] ${pid}\n`);
+    const code = this.exec(node, { ...io, in: null });
+    this.lastBg = pid;
+    this.jobCodes.set(pid, code);
+    if (this.jobCodes.size > 100) this.jobCodes.delete(this.jobCodes.keys().next().value);
+    if (top) this.jobs.push({ n, pid, cmd: node.src || '', code, born: this.runId });
+    this.exiting = false;
+    return (this.lastCode = 0);
+  }
+
   runPipe(p, io) {
-    let input = io.in, code = 0;
+    if (p.bang) { this.condDepth++; try { return this.runPipe({ ...p, bang: false }, io) ? 0 : 1; } finally { this.condDepth--; } }
+    let input = io.in, code = 0, failed = 0;
     p.cmds.forEach((cmd, idx) => {
       const last = idx === p.cmds.length - 1;
       let buf = '';
@@ -731,9 +1026,10 @@ export class Shell {
         this.budget.loops = 0;
         code = 141;
       }
+      if (code) failed = code;
       input = { text: buf, pos: 0 };
     });
-    return p.bang ? (code ? 0 : 1) : code;
+    return this.opts.pipefail && failed ? (code || failed) : code;
   }
 
   runCommand(node, io) {
@@ -744,7 +1040,11 @@ export class Shell {
       this.cmdLog.push({ name: 'function', args: [node.name], code: 0 });
       return 0;
     }
-    const code = this.withRedirs(node.redirs, io, io2 => this.runCompound(node, io2));
+    let code;
+    try { code = this.withRedirs(node.redirs, io, io2 => this.runCompound(node, io2)); } catch (e) {
+      if (!(e instanceof ExpandErr)) throw e;
+      code = this.expandError(e, io);
+    }
     const kw = { if: 'if', for: 'for', cfor: 'for', while: node.until ? 'until' : 'while', case: 'case', dbr: '[[', arith: '((' }[node.type];
     if (kw) this.cmdLog.push({ name: kw, args: [], code });
     return code;
@@ -769,14 +1069,17 @@ export class Shell {
     switch (node.type) {
       case 'group': return this.exec(node.body, io);
       case 'subshell': {
-        const saved = { cwd: this.cwd, env: this.env, exported: this.exported, funcs: this.funcs, aliases: this.aliases, umask: this.fs.umask };
+        const saved = { cwd: this.cwd, env: this.env, exported: this.exported, funcs: this.funcs, aliases: this.aliases, umask: this.fs.umask, arrays: this.arrays, opts: this.opts, dirStack: this.dirStack };
         this.env = Object.assign(Object.create(null), this.env);
+        this.arrays = Object.assign(Object.create(null), ...Object.keys(this.arrays).map(k => ({ [k]: [...this.arrays[k]] })));
+        this.opts = { ...this.opts };
+        this.dirStack = [...this.dirStack];
         this.exported = new Set(this.exported);
         this.funcs = Object.assign(Object.create(null), this.funcs);
         this.aliases = Object.assign(Object.create(null), this.aliases);
         this.depth++;
         try { return this.exec(node.body, io); } finally {
-          Object.assign(this, { cwd: saved.cwd, env: saved.env, exported: saved.exported, funcs: saved.funcs, aliases: saved.aliases });
+          Object.assign(this, { cwd: saved.cwd, env: saved.env, exported: saved.exported, funcs: saved.funcs, aliases: saved.aliases, arrays: saved.arrays, opts: saved.opts, dirStack: saved.dirStack });
           this.fs.umask = saved.umask;
           this.depth--;
           this.exiting = false;
@@ -784,7 +1087,9 @@ export class Shell {
       }
       case 'if': {
         for (const cl of node.clauses) {
-          const c = this.exec(cl.cond, io);
+          this.condDepth++;
+          let c;
+          try { c = this.exec(cl.cond, io); } finally { this.condDepth--; }
           if (this.exiting) return c;
           if (c === 0) return this.exec(cl.body, io);
         }
@@ -795,7 +1100,7 @@ export class Shell {
         this.lastCode = 0;
         for (const v of words) {
           this.tick(true);
-          this.env[node.name] = v;
+          this.setVar(node.name, v);
           if (this.loopStep(node.body, io) === 'break') break;
         }
         return this.lastCode;
@@ -815,7 +1120,9 @@ export class Shell {
         let code = 0;
         for (;;) {
           this.tick(true);
-          const c = this.exec(node.cond, io);
+          this.condDepth++;
+          let c;
+          try { c = this.exec(node.cond, io); } finally { this.condDepth--; }
           if (this.exiting || (c === 0) === node.until) break;
           const r = this.loopStep(node.body, io);
           code = this.lastCode;
@@ -825,7 +1132,7 @@ export class Shell {
       });
       case 'case': {
         let w;
-        try { w = this.expand(node.word, false)[0]; } catch (e) { if (e instanceof ExpandErr) { io.err(`bash: ${e.message}\n`); return 1; } throw e; }
+        try { w = this.expand(node.word, false)[0]; } catch (e) { if (e instanceof ExpandErr) return this.expandError(e, io); throw e; }
         for (const it of node.items) {
           if (it.pats.some(pt => this.patternRe(pt).test(w))) return this.exec(it.body, io);
         }
@@ -893,6 +1200,7 @@ export class Shell {
       if (i < toks.length) throw new SyntaxErr(`unexpected token \`${toks[i].v}'`);
       return v ? 0 : 1;
     } catch (e) {
+      if (e instanceof FatalExpand) return this.expandError(e, io);
       if (e instanceof SyntaxErr || e instanceof ExpandErr) { io.err(`bash: conditional expression: ${e.message}\n`); return 2; }
       throw e;
     }
@@ -936,7 +1244,7 @@ export class Shell {
         else { out = sink; tty = false; }
       }
     } catch (e) {
-      if (e instanceof ExpandErr) { io.err(`bash: ${e.message}\n`); return 1; }
+      if (e instanceof ExpandErr) return this.expandError(e, io);
       if (!(e instanceof FsError)) throw e;
       const r = redirs.find(x => x.target);
       io.err(`bash: ${r ? restore(r.target) : ''}: ${e.message}\n`);
@@ -952,21 +1260,36 @@ export class Shell {
       words = [...al, ...words.slice(1)];
     }
     const assigns = [];
-    while (words.length && /^[A-Za-z_]\w*\+?=/.test(words[0])) assigns.push(words.shift());
+    while (words.length && ASSIGN.test(words[0])) assigns.push(words.shift());
+    const decl = words.length && DECL.has(words[0]);
     let argv;
-    try { argv = words.flatMap(w => this.expand(w)); } catch (e) {
-      if (e instanceof ExpandErr) { io.err(`bash: ${e.message}\n`); return 1; }
+    try {
+      argv = words.flatMap((w, k) => {
+        // declare/local/export x=$y: no word splitting; arrays are handed over unexpanded.
+        if (k > 0 && decl && ASSIGN.test(w)) return [/^[^=]*=\(/.test(w) && w.endsWith(')') ? RAW + w : this.expand(w, false)[0]];
+        return this.expand(w);
+      });
+    } catch (e) {
+      if (e instanceof ExpandErr) return this.expandError(e, io);
       throw e;
     }
     return this.withRedirs(cmd.redirs, io, io2 => {
       const saved = Object.create(null);
-      for (const a of assigns) {
-        const eq = a.indexOf('=');
-        const append = a[eq - 1] === '+';
-        const k = a.slice(0, append ? eq - 1 : eq);
-        if (argv.length) saved[k] = this.env[k];
-        const v = this.expand(a.slice(eq + 1), false)[0] ?? '';
-        this.env[k] = append ? (this.env[k] ?? '') + v : v;
+      const traced = [];
+      try {
+        for (const a of assigns) {
+          const [, name, idx, plus, value] = ASSIGN.exec(a);
+          if (argv.length && idx === undefined) saved[name] = Object.hasOwn(this.env, name) ? this.env[name] : undefined;
+          this.assign(name, idx, plus === '+', value);
+          if (this.opts.xtrace) traced.push(`${name}${idx !== undefined ? `[${idx}]` : ''}${plus}=${this.paramAt(name, idx) ?? ''}`);
+        }
+      } catch (e) {
+        if (e instanceof ExpandErr) return this.expandError(e, io);
+        throw e;
+      }
+      if (this.opts.xtrace && (traced.length || argv.length)) {
+        const q = x => (/^[\w@%+=:,./-]+$/.test(x) ? x : `'${x.replace(/'/g, "'\\''")}'`);
+        io.err('+ ' + [...traced.map(q), ...argv.map(x => q(x.replace(RAW, '')))].join(' ') + '\n');
       }
       if (!argv.length) return 0;
       try {
@@ -994,7 +1317,11 @@ export class Shell {
     const ctx = {
       name, args: argv.slice(1), out: io.out, err: io.err, tty: io.tty, io,
       sh: this, fs: this.fs, p: x => normalize(x, this.cwd), fail: 0,
-      get stdin() {
+    };
+    // Not enumerable: a copy like {...ctx} must not consume the input by reading it.
+    Object.defineProperty(ctx, 'stdin', {
+      enumerable: false,
+      get() {
         if (!stdinRead) {
           stdinRead = true;
           if (io.stdin !== undefined) stdinVal = io.stdin;
@@ -1003,12 +1330,13 @@ export class Shell {
         }
         return stdinVal;
       },
-    };
+    });
     let code;
     try { code = fn(ctx); } catch (e) {
       if (e instanceof Signal) throw e;
       if (e instanceof Usage) { io.err(`${name}: ${e.message}\nTry 'man ${name}' for more information.\n`); code = 2; }
       else if (e instanceof FsError) { io.err(`${name}: ${e.message}\n`); code = 1; }
+      else if (e instanceof ExpandErr) code = this.expandError(e, io);
       else { io.err(`${name}: internal error: ${e.message}\n`); code = 70; }
     }
     code = code ?? (ctx.fail ? 1 : 0);
@@ -1029,7 +1357,13 @@ export class Shell {
       if (sig instanceof ReturnSig) code = sig.n; else throw sig;
     } finally {
       const frame = this.frames.pop();
-      for (const k of Object.keys(frame)) { if (frame[k] === undefined) delete this.env[k]; else this.env[k] = frame[k]; }
+      for (const k of Object.keys(frame)) {
+        const f = frame[k];
+        if (f.env === undefined) delete this.env[k]; else this.env[k] = f.env;
+        if (f.arr === undefined) delete this.arrays[k]; else this.arrays[k] = f.arr;
+        if (f.int) this.intVars.add(k); else this.intVars.delete(k);
+        if (f.ro) this.readonly.add(k); else this.readonly.delete(k);
+      }
       this.funcDepth--;
       this.argv = savedArgv;
     }
@@ -1052,33 +1386,56 @@ export class Shell {
       io.err(`bash: ${name}: cannot execute binary file: Exec format error\n`);
       return 126;
     }
-    const code = this.runScript(node.d, argv, io);
+    const code = this.runScript(node.d, argv, io, true);
     this.cmdLog.push({ name, args: argv.slice(1), code, script: true });
     return code;
   }
 
   // Run a whole script (multi-line constructs allowed) with its own positional parameters.
-  runScript(text, argv, io) {
+  // child: started as its own bash process (not `source`), so options and traps start fresh.
+  runScript(text, argv, io, child = false) {
     if (this.depth >= 8) { io.err('bash: maximum script nesting level exceeded\n'); return 1; }
     let tree;
-    try { tree = parse(lex(text)); } catch (e) {
+    try { tree = parse(lex(text), text); } catch (e) {
       if (!(e instanceof SyntaxErr)) throw e;
       io.err(`bash: ${argv[0]}: ${e.message}\n`);
       return 2;
     }
-    const saved = { argv: this.argv, loopDepth: this.loopDepth };
+    const saved = { argv: this.argv, loopDepth: this.loopDepth, traps: this.traps, getopt: this.getopt, optind: this.env.OPTIND, opts: this.opts, dirStack: this.dirStack };
     this.argv = argv;
     this.loopDepth = 0;
+    if (child) {
+      this.traps = Object.create(null);
+      this.opts = { errexit: false, nounset: false, xtrace: false, pipefail: false };
+      this.dirStack = [];
+    }
+    this.getopt = { ind: 1, sub: 1 };
+    this.env.OPTIND = '1';
     this.depth++;
+    const sio = this.normIo(io);
     let code = 0;
-    try { code = this.exec(tree, this.normIo(io)); } catch (sig) {
-      if (sig instanceof ReturnSig) code = sig.n;
-      else if (sig instanceof BreakSig || sig instanceof ContinueSig) code = 0;
-      else throw sig;
+    try {
+      try { code = this.exec(tree, sio); } catch (sig) {
+        if (sig instanceof ReturnSig) code = sig.n;
+        else if (sig instanceof BreakSig || sig instanceof ContinueSig) code = 0;
+        else throw sig;
+      }
+      if (this.exiting) code = this.lastCode;
+      if (child && this.traps.EXIT) {
+        // The EXIT trap runs when the script ends, with $? set to its exit status.
+        this.exiting = false;
+        this.lastCode = code;
+        const t = this.traps.EXIT;
+        delete this.traps.EXIT;
+        this.runLine(t, sio);
+      }
     } finally {
       this.depth--;
       this.argv = saved.argv;
       this.loopDepth = saved.loopDepth;
+      if (child) Object.assign(this, { traps: saved.traps, opts: saved.opts, dirStack: saved.dirStack });
+      this.getopt = saved.getopt;
+      if (saved.optind === undefined) delete this.env.OPTIND; else this.env.OPTIND = saved.optind;
       this.exiting = false; // `exit` only leaves the innermost script
     }
     return code;
@@ -1093,8 +1450,16 @@ export class Shell {
     let options;
     let prefix = '';
     let base = word;
-    if (first && !word.includes('/')) {
-      options = [...new Set([...Object.keys(commands), ...Object.keys(this.aliases)])]
+    const dv = /^(.*?)(\$\{?)([A-Za-z_]\w*)?$/.exec(word);
+    if (dv && !dv[1].includes('$')) {
+      // $VAR / ${VAR completion
+      prefix = dv[1] + dv[2];
+      base = dv[3] || '';
+      const close = dv[2] === '${' ? '}' : '';
+      options = [...new Set([...Object.keys(this.env), ...Object.keys(this.arrays), 'RANDOM', 'SECONDS', 'UID', 'PWD'])]
+        .filter(n => n.startsWith(base)).sort().map(n => ({ n, suffix: close || ' ', raw: true }));
+    } else if (first && !word.includes('/')) {
+      options = [...new Set([...Object.keys(commands), ...Object.keys(this.aliases), ...Object.keys(this.funcs)])]
         .filter(n => n.startsWith(word) && n !== '[' && n !== '.').sort().map(n => ({ n, suffix: ' ' }));
     } else {
       const slash = word.lastIndexOf('/');
@@ -1102,6 +1467,7 @@ export class Shell {
       base = word.slice(slash + 1);
       let dir = prefix || '.';
       if (dir.startsWith('~')) dir = (this.env.HOME || '/') + dir.slice(1);
+      dir = dir.replace(/\$\{?([A-Za-z_]\w*)\}?/g, (m, k) => this.param(k) ?? '');
       const abs = normalize(dir, this.cwd);
       let names = [];
       try { names = this.fs.readdir(abs); } catch { /* unreadable */ }
@@ -1124,7 +1490,8 @@ export class Shell {
 
 // ---------- builtins that need the interpreter's control-flow signals ----------
 
-for (const b of ['break', 'continue', 'return', 'local', 'read', 'shift', 'let', ':']) BUILTINS.add(b);
+for (const b of ['break', 'continue', 'return', 'local', 'read', 'shift', 'let', ':', 'declare', 'typeset', 'readonly',
+  'set', 'mapfile', 'readarray', 'getopts', 'trap', 'pushd', 'popd', 'dirs', 'jobs', 'wait', 'fg', 'bg']) BUILTINS.add(b);
 
 const loopCount = (ctx, name) => {
   const a = ctx.args[0];
@@ -1151,18 +1518,6 @@ commands.return = ctx => {
   if (a !== undefined && !/^-?\d+$/.test(a)) { ctx.err(`bash: return: ${a}: numeric argument required\n`); throw new ReturnSig(2); }
   throw new ReturnSig(a === undefined ? sh.lastCode : ((+a % 256) + 256) % 256);
 };
-commands.local = ctx => {
-  const sh = ctx.sh;
-  if (!sh.funcDepth) { ctx.err('bash: local: can only be used in a function\n'); return 1; }
-  const frame = sh.frames[sh.frames.length - 1];
-  for (const a of ctx.args) {
-    const eq = a.indexOf('=');
-    const k = eq < 0 ? a : a.slice(0, eq);
-    if (!/^[A-Za-z_]\w*$/.test(k)) { ctx.err(`bash: local: \`${a}': not a valid identifier\n`); ctx.fail = 1; continue; }
-    if (!Object.hasOwn(frame, k)) frame[k] = Object.hasOwn(sh.env, k) ? sh.env[k] : undefined;
-    sh.env[k] = eq < 0 ? '' : a.slice(eq + 1);
-  }
-};
 commands.shift = ctx => {
   const sh = ctx.sh;
   const n = ctx.args[0] === undefined ? 1 : Number(ctx.args[0]);
@@ -1180,7 +1535,7 @@ commands[':'] = () => 0;
 
 // read [-r] [-p PROMPT] [NAME...]: reads one line from the shared input cursor.
 commands.read = ctx => {
-  const { o, rest } = opts(ctx, 'rs', 'pd');
+  const { o, rest } = opts(ctx, 'rs', 'pda');
   const r = ctx.io.in;
   if (!r) {
     ctx.err('bash: read: HackTerm kann nicht auf Tastatureingaben warten - leite Daten hinein, z.B.:\n' +
@@ -1199,33 +1554,449 @@ commands.read = ctx => {
   const names = rest.length ? rest : ['REPLY'];
   const bad = names.find(n => !/^[A-Za-z_]\w*$/.test(n));
   if (bad) { ctx.err(`bash: read: \`${bad}': not a valid identifier\n`); return 1; }
-  const env = ctx.sh.env;
-  if (!rest.length) { env.REPLY = line; return eof ? 1 : 0; }
+  const sh = ctx.sh, env = sh.env;
+  if (o.a !== undefined && !/^[A-Za-z_]\w*$/.test(o.a)) { ctx.err(`bash: read: \`${o.a}': not a valid identifier\n`); return 1; }
+  if (o.a === undefined && !rest.length) { sh.setVar('REPLY', line); return eof ? 1 : 0; }
   const ifs = Object.hasOwn(env, 'IFS') ? env.IFS : ' \t\n';
   const ws = [...ifs].filter(c => ' \t\n'.includes(c)).join('');
   const other = [...ifs].filter(c => !' \t\n'.includes(c)).join('');
   const esc = x => x.replace(/[\]\\^-]/g, '\\$&');
   let s = ws ? line.replace(new RegExp(`^[${esc(ws)}]+|[${esc(ws)}]+$`, 'g'), '') : line;
   const sep = new RegExp(`[${esc(ws)}]*${other ? `[${esc(other)}]` : `[${esc(ws)}]`}[${esc(ws)}]*|[${esc(ws)}]+`);
+  if (o.a !== undefined) {
+    // read -a NAME: every field becomes an array element.
+    if (sh.readonly.has(o.a)) { ctx.err(`bash: ${o.a}: readonly variable\n`); return 1; }
+    const items = [];
+    while (s) {
+      const m = sep.exec(s);
+      if (!m) { items.push(s); break; }
+      items.push(s.slice(0, m.index));
+      s = s.slice(m.index + m[0].length);
+    }
+    sh.arrays[o.a] = items.slice(0, 10000);
+    delete env[o.a];
+    return eof ? 1 : 0;
+  }
   names.forEach((n, k) => {
-    if (k === names.length - 1 || !ifs) { env[n] = s; s = ''; return; }
+    if (k === names.length - 1 || !ifs) { sh.setVar(n, s); s = ''; return; }
     const m = sep.exec(s);
-    if (!m) { env[n] = s; s = ''; return; }
-    env[n] = s.slice(0, m.index);
+    if (!m) { sh.setVar(n, s); s = ''; return; }
+    sh.setVar(n, s.slice(0, m.index));
     s = s.slice(m.index + m[0].length);
   });
   return eof ? 1 : 0;
 };
 
-// unset also removes functions (unset -f NAME, or a name that is not a variable).
-const unsetVar = commands.unset;
+// ---------- variables: declare / typeset / local / readonly / unset ----------
+
+const dq = v => `"${String(v).replace(/(["\\$`])/g, '\\$1')}"`;
+const funcText = (name, f) => {
+  let src = (f.src || '{ ... }').trim();
+  if (!/^[({]/.test(src)) src = src.replace(/^(?:function\s+)?[^\s(]+\s*(?:\(\s*\))?\s*/, '');
+  return `${name} () ${src}\n`;
+};
+
+// One line of `declare -p` output.
+function describeVar(sh, k) {
+  const isArr = Object.hasOwn(sh.arrays, k);
+  if (!isArr && !Object.hasOwn(sh.env, k)) return null;
+  let fl = (isArr ? 'a' : '') + (sh.intVars.has(k) ? 'i' : '') + (sh.readonly.has(k) ? 'r' : '') + (sh.exported.has(k) && !isArr ? 'x' : '');
+  fl = fl ? '-' + fl : '--';
+  if (!isArr) return `declare ${fl} ${k}=${dq(sh.env[k])}\n`;
+  const items = sh.arrays[k].map((v, i) => (v === undefined || v === null ? null : `[${i}]=${dq(v)}`)).filter(Boolean);
+  return `declare ${fl} ${k}=(${items.join(' ')})\n`;
+}
+
+function declare(ctx, mode) {
+  const sh = ctx.sh, args = ctx.args;
+  const on = new Set(), off = new Set();
+  let i = 0;
+  for (; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--') { i++; break; }
+    if (!/^[-+][A-Za-z]+$/.test(a)) break;
+    for (const c of a.slice(1)) {
+      if (c === 'A') { ctx.err(`bash: ${mode}: -A: assoziative Arrays kennt HackTerm (noch) nicht - nimm ein normales Array: a=(x y z)\n`); return 2; }
+      if (!'aifFgprx'.includes(c)) { ctx.err(`bash: ${mode}: -${c}: invalid option\nusage: ${mode} [-aifFgprx] [name[=value] ...]\n`); return 2; }
+      (a[0] === '-' ? on : off).add(c);
+    }
+  }
+  const names = args.slice(i);
+  if (mode === 'readonly') on.add('r');
+  if (mode === 'local' && !sh.funcDepth) { ctx.err('bash: local: can only be used in a function\n'); return 1; }
+  const scoped = (mode === 'local' || ((mode === 'declare' || mode === 'typeset') && !on.has('g'))) && sh.funcDepth > 0;
+
+  // Functions: declare -f [NAME] prints the source, -F only the names.
+  if (on.has('f') || on.has('F')) {
+    const list = names.length ? names : Object.keys(sh.funcs).sort();
+    for (const n of list) {
+      if (!Object.hasOwn(sh.funcs, n)) { ctx.fail = 1; continue; }
+      ctx.out(on.has('F') ? `declare -f ${n}\n` : funcText(n, sh.funcs[n]));
+    }
+    return;
+  }
+  // Listing: no names (or -p).
+  if (!names.length || (on.has('p') && names.every(n => /^[A-Za-z_]\w*$/.test(n)))) {
+    const keys = names.length ? names : [...new Set([...Object.keys(sh.env), ...Object.keys(sh.arrays)])].sort();
+    for (const k of keys) {
+      const want = !names.length && (on.size || off.size) && !(on.size === 1 && on.has('p'));
+      if (want && ((on.has('a') && !Object.hasOwn(sh.arrays, k)) || (on.has('r') && !sh.readonly.has(k))
+        || (on.has('i') && !sh.intVars.has(k)) || (on.has('x') && !sh.exported.has(k)))) continue;
+      const line = describeVar(sh, k);
+      if (line) ctx.out(on.has('p') || mode !== 'declare' || want ? line : line.replace(/^declare \S+ /, ''));
+      else if (names.length) { ctx.err(`bash: ${mode}: ${k}: not found\n`); ctx.fail = 1; }
+    }
+    return;
+  }
+  for (let a of names) {
+    const raw = a.startsWith(RAW);
+    if (raw) a = a.slice(1);
+    const m = /^([A-Za-z_]\w*)(?:\[([^\]]*)\])?(?:(\+?)=([\s\S]*))?$/.exec(a);
+    if (!m) { ctx.err(`bash: ${mode}: \`${a}': not a valid identifier\n`); ctx.fail = 1; continue; }
+    const [, k, idx, plus, value] = m;
+    const assigning = value !== undefined;
+    if (sh.readonly.has(k) && (assigning || off.has('r') || on.has('a') || on.has('i'))) {
+      ctx.err(`bash: ${mode}: ${k}: readonly variable\n`); ctx.fail = 1; continue;
+    }
+    if (scoped) {
+      const fresh = !Object.hasOwn(sh.frames[sh.frames.length - 1], k);
+      sh.saveLocal(k);
+      // A new local starts empty unless it is assigned right away.
+      if (fresh) { delete sh.env[k]; delete sh.arrays[k]; sh.intVars.delete(k); if (!assigning && !on.has('a')) sh.env[k] = ''; }
+    }
+    if (on.has('a') && !Object.hasOwn(sh.arrays, k)) {
+      sh.arrays[k] = Object.hasOwn(sh.env, k) && sh.env[k] !== '' ? [sh.env[k]] : [];
+      delete sh.env[k];
+    }
+    if (on.has('i')) sh.intVars.add(k);
+    if (off.has('i')) sh.intVars.delete(k);
+    try {
+      if (assigning) sh.assign(k, idx, plus === '+', value, !raw);
+      else if (!Object.hasOwn(sh.env, k) && !Object.hasOwn(sh.arrays, k) && (on.has('r') || on.has('x'))) sh.env[k] = '';
+    } catch (e) {
+      ctx.err(`bash: ${mode}: ${e.message}\n`); ctx.fail = 1; continue;
+    }
+    if (on.has('x')) sh.exported.add(k);
+    if (off.has('x')) sh.exported.delete(k);
+    if (on.has('r')) sh.readonly.add(k);
+  }
+}
+commands.declare = ctx => declare(ctx, 'declare');
+commands.typeset = ctx => declare(ctx, 'typeset');
+commands.local = ctx => declare(ctx, 'local');
+commands.readonly = ctx => declare(ctx, 'readonly');
+
 commands.unset = ctx => {
   const sh = ctx.sh;
-  if (ctx.args[0] === '-f') { for (const k of ctx.args.slice(1)) delete sh.funcs[k]; return; }
-  const names = ctx.args.filter(a => a !== '-v');
-  for (const k of names) if (!Object.hasOwn(sh.env, k) && Object.hasOwn(sh.funcs, k) && ctx.args[0] !== '-v') delete sh.funcs[k];
-  return unsetVar({ ...ctx, args: names });
+  let mode = '';
+  const names = ctx.args.filter(a => {
+    if (/^-[fvn]+$/.test(a)) { mode = a.includes('f') ? 'f' : 'v'; return false; }
+    return true;
+  });
+  for (const a of names) {
+    const m = /^([A-Za-z_]\w*)(?:\[([^\]]*)\])?$/.exec(a);
+    if (!m) { ctx.err(`bash: unset: \`${a}': not a valid identifier\n`); ctx.fail = 1; continue; }
+    const [, k, idx] = m;
+    if (mode === 'f') { delete sh.funcs[k]; continue; }
+    const isVar = Object.hasOwn(sh.env, k) || Object.hasOwn(sh.arrays, k);
+    if (!isVar && !mode && idx === undefined && Object.hasOwn(sh.funcs, k)) { delete sh.funcs[k]; continue; }
+    if (!isVar) continue;
+    if (sh.readonly.has(k)) { ctx.err(`bash: unset: ${k}: cannot unset: readonly variable\n`); ctx.fail = 1; continue; }
+    if (idx !== undefined && idx !== '@' && idx !== '*') {
+      if (!Object.hasOwn(sh.arrays, k)) { if (sh.arrayIndex(k, idx) === 0) delete sh.env[k]; continue; }
+      const n = sh.arrayIndex(k, idx);
+      if (n < sh.arrays[k].length) sh.arrays[k][n] = null;
+      continue;
+    }
+    delete sh.env[k];
+    delete sh.arrays[k];
+    sh.exported.delete(k);
+    sh.intVars.delete(k);
+  }
 };
+
+// printf -v VAR FORMAT ...: store the result instead of printing it.
+const printfOut = commands.printf;
+commands.printf = ctx => {
+  if (ctx.args[0] !== '-v') return printfOut(ctx);
+  const target = ctx.args[1];
+  const m = /^([A-Za-z_]\w*)(?:\[([^\]]*)\])?$/.exec(target ?? '');
+  if (!m) { ctx.err(`bash: printf: \`${target ?? ''}': not a valid identifier\n`); return 2; }
+  let buf = '';
+  const sub = { ...ctx, args: ctx.args.slice(2), out: t => { buf += t; }, fail: 0 };
+  const code = printfOut(sub) ?? (sub.fail ? 1 : 0);
+  ctx.sh.assign(m[1], m[2], false, buf, true);
+  return code;
+};
+
+// ---------- set ----------
+
+const SET_LONG = { errexit: 'e', nounset: 'u', xtrace: 'x', pipefail: null };
+commands.set = ctx => {
+  const sh = ctx.sh, args = ctx.args;
+  if (!args.length) {
+    const keys = [...new Set([...Object.keys(sh.env), ...Object.keys(sh.arrays)])].sort();
+    for (const k of keys) {
+      if (Object.hasOwn(sh.arrays, k)) ctx.out(describeVar(sh, k).replace(/^declare \S+ /, ''));
+      else ctx.out(`${k}='${sh.env[k].replace(/'/g, "'\\''")}'\n`);
+    }
+    return;
+  }
+  const short = { e: 'errexit', u: 'nounset', x: 'xtrace' };
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--' || a === '-') { sh.argv = [sh.argv[0], ...args.slice(i + 1)]; return; }
+    if (a === '-o' || a === '+o') {
+      const name = args[i + 1];
+      if (name === undefined) {
+        for (const k of Object.keys(SET_LONG)) ctx.out(a === '-o' ? `${k.padEnd(15)}\t${sh.opts[k] ? 'on' : 'off'}\n` : `set ${sh.opts[k] ? '-' : '+'}o ${k}\n`);
+        return;
+      }
+      if (!Object.hasOwn(SET_LONG, name)) { ctx.err(`bash: set: ${name}: invalid option name\n`); return 2; }
+      sh.opts[name] = a === '-o';
+      i++;
+      continue;
+    }
+    if (/^[-+][A-Za-z]+$/.test(a)) {
+      for (const c of a.slice(1)) {
+        if (!short[c]) { ctx.err(`bash: set: ${a[0]}${c}: invalid option\nset: usage: set [-eux] [-o errexit|nounset|xtrace|pipefail] [--] [arg ...]\n`); return 2; }
+        sh.opts[short[c]] = a[0] === '-';
+      }
+      continue;
+    }
+    // Anything else replaces the positional parameters.
+    sh.argv = [sh.argv[0], ...args.slice(i)];
+    return;
+  }
+};
+
+// ---------- mapfile / readarray ----------
+
+commands.mapfile = commands.readarray = ctx => {
+  const { o, rest } = opts(ctx, 't', 'nsdu');
+  const sh = ctx.sh, name = rest[0] ?? 'MAPFILE';
+  if (!/^[A-Za-z_]\w*$/.test(name)) { ctx.err(`bash: ${ctx.name}: \`${name}': not a valid identifier\n`); return 1; }
+  if (sh.readonly.has(name)) { ctx.err(`bash: ${ctx.name}: ${name}: readonly variable\n`); return 1; }
+  const text = ctx.stdin;
+  if (text === null) { ctx.err(`bash: ${ctx.name}: HackTerm kann nicht auf Tastatureingaben warten - nutze: mapfile -t zeilen < datei\n`); return 1; }
+  const d = o.d === undefined ? '\n' : (o.d[0] ?? '\0');
+  const items = [];
+  let pos = 0;
+  while (pos < text.length && items.length < 10000) {
+    const j = text.indexOf(d, pos);
+    const end = j < 0 ? text.length : j + 1;
+    const item = text.slice(pos, end);
+    items.push(o.t && j >= 0 ? item.slice(0, -1) : item);
+    pos = end;
+  }
+  const skip = parseInt(o.s ?? '0', 10) || 0, max = parseInt(o.n ?? '0', 10) || 0;
+  sh.arrays[name] = items.slice(skip, max ? skip + max : undefined);
+  delete sh.env[name];
+};
+
+// ---------- getopts ----------
+
+commands.getopts = ctx => {
+  const sh = ctx.sh;
+  const [spec, name, ...given] = ctx.args;
+  if (spec === undefined || name === undefined) { ctx.err('bash: getopts: usage: getopts optstring name [arg ...]\n'); return 2; }
+  if (!/^[A-Za-z_]\w*$/.test(name)) { ctx.err(`bash: getopts: \`${name}': not a valid identifier\n`); return 1; }
+  const args = given.length ? given : sh.argv.slice(1);
+  const g = sh.getopt;
+  // OPTIND=1 by the user restarts the scan.
+  if (String(g.ind) !== String(sh.env.OPTIND ?? '1')) { g.ind = Math.max(1, parseInt(sh.env.OPTIND, 10) || 1); g.sub = 1; }
+  const silent = spec.startsWith(':');
+  const done = () => { sh.setVar(name, '?'); sh.env.OPTIND = String(g.ind); return 1; };
+  const word = args[g.ind - 1];
+  if (word === undefined) return done();
+  if (g.sub === 1) {
+    if (word === '--') { g.ind++; return done(); }
+    if (!word.startsWith('-') || word === '-') return done();
+  }
+  const c = word[g.sub];
+  g.sub++;
+  const restOfWord = word.slice(g.sub);
+  if (g.sub >= word.length) { g.ind++; g.sub = 1; }
+  const at = c === ':' ? -1 : spec.indexOf(c);
+  delete sh.env.OPTARG;
+  if (at < 0) {
+    if (silent) sh.env.OPTARG = c;
+    else ctx.err(`${sh.argv[0]}: illegal option -- ${c}\n`);
+    sh.setVar(name, '?');
+  } else if (spec[at + 1] === ':') {
+    if (restOfWord) { sh.env.OPTARG = restOfWord; g.ind++; g.sub = 1; sh.setVar(name, c); }
+    else if (args[g.ind - 1] !== undefined) { sh.env.OPTARG = args[g.ind - 1]; g.ind++; sh.setVar(name, c); }
+    else if (silent) { sh.env.OPTARG = c; sh.setVar(name, ':'); }
+    else { ctx.err(`${sh.argv[0]}: option requires an argument -- ${c}\n`); sh.setVar(name, '?'); }
+  } else sh.setVar(name, c);
+  sh.env.OPTIND = String(g.ind);
+  return 0;
+};
+
+// ---------- trap ----------
+
+const SIGNALS = ['EXIT', 'HUP', 'INT', 'QUIT', 'ILL', 'TRAP', 'ABRT', 'BUS', 'FPE', 'KILL', 'USR1', 'SEGV', 'USR2', 'PIPE', 'ALRM', 'TERM'];
+const sigName = x => {
+  if (/^\d+$/.test(x)) return SIGNALS[+x];
+  const n = x.toUpperCase().replace(/^SIG/, '');
+  return SIGNALS.includes(n) || n === 'ERR' || n === 'DEBUG' || n === 'RETURN' ? n : undefined;
+};
+commands.trap = ctx => {
+  const sh = ctx.sh;
+  let args = ctx.args;
+  if (args[0] === '-l') { ctx.out(SIGNALS.slice(1).map((n, i) => `${String(i + 1).padStart(2)}) SIG${n}`).join('\n') + '\n'); return; }
+  if (args[0] === '--') args = args.slice(1);
+  if (!args.length || args[0] === '-p') {
+    const want = args.slice(1).map(sigName);
+    for (const k of Object.keys(sh.traps)) if (!want.length || want.includes(k)) ctx.out(`trap -- '${sh.traps[k].replace(/'/g, "'\\''")}' ${k}\n`);
+    return;
+  }
+  // `trap SIG` alone resets it, like `trap - SIG`.
+  let action = args[0], sigs = args.slice(1);
+  if (!sigs.length) { sigs = [action]; action = '-'; }
+  for (const x of sigs) {
+    const n = sigName(x);
+    if (!n) { ctx.err(`bash: trap: ${x}: invalid signal specification\n`); ctx.fail = 1; continue; }
+    if (action === '-') delete sh.traps[n]; else sh.traps[n] = action;
+  }
+};
+// exit at the prompt still runs the EXIT trap, even if there is no way out of HackTerm.
+const exitCmd = commands.exit;
+commands.exit = commands.logout = ctx => {
+  const sh = ctx.sh;
+  if (!sh.depth && sh.traps.EXIT) {
+    const t = sh.traps.EXIT;
+    delete sh.traps.EXIT;
+    sh.runLine(t, ctx.io);
+  }
+  return exitCmd(ctx);
+};
+
+// ---------- directory stack ----------
+
+const tilde = (sh, d) => (sh.env.HOME && (d === sh.env.HOME || d.startsWith(sh.env.HOME + '/')) ? '~' + d.slice(sh.env.HOME.length) : d);
+function printDirs(ctx, flags = '') {
+  const sh = ctx.sh, all = [sh.cwd, ...sh.dirStack];
+  const show = d => (flags.includes('l') ? d : tilde(sh, d));
+  if (flags.includes('v')) all.forEach((d, i) => ctx.out(`${String(i).padStart(2)}  ${show(d)}\n`));
+  else if (flags.includes('p')) all.forEach(d => ctx.out(show(d) + '\n'));
+  else ctx.out(all.map(show).join(' ') + '\n');
+}
+function changeDir(ctx, d, who) {
+  const sub = { ...ctx, args: [d], fail: 0, out: () => {}, err: t => ctx.err(t.replace('bash: cd:', `bash: ${who}:`)) };
+  const r = commands.cd(sub);
+  return (r ?? (sub.fail ? 1 : 0)) === 0;
+}
+commands.dirs = ctx => {
+  const sh = ctx.sh;
+  const flags = ctx.args.filter(a => /^-[clpv]+$/.test(a)).join('');
+  if (flags.includes('c')) { sh.dirStack = []; return; }
+  printDirs(ctx, flags);
+};
+commands.pushd = ctx => {
+  const sh = ctx.sh, a = ctx.args.filter(x => x !== '-n');
+  const from = sh.cwd;
+  if (!a.length) {
+    if (!sh.dirStack.length) { ctx.err('bash: pushd: no other directory\n'); return 1; }
+    const top = sh.dirStack[0];
+    if (!changeDir(ctx, top, 'pushd')) return 1;
+    sh.dirStack[0] = from;
+  } else if (/^[+-]\d+$/.test(a[0])) {
+    const all = [sh.cwd, ...sh.dirStack];
+    const n = +a[0].slice(1), k = a[0][0] === '+' ? n : all.length - 1 - n;
+    if (k < 0 || k >= all.length) { ctx.err(`bash: pushd: ${a[0]}: directory stack index out of range\n`); return 1; }
+    const rot = [...all.slice(k), ...all.slice(0, k)];
+    if (!changeDir(ctx, rot[0], 'pushd')) return 1;
+    sh.dirStack = rot.slice(1);
+  } else {
+    if (!changeDir(ctx, a[0], 'pushd')) return 1;
+    sh.dirStack.unshift(from);
+    if (sh.dirStack.length > 100) sh.dirStack.length = 100;
+  }
+  printDirs(ctx);
+};
+commands.popd = ctx => {
+  const sh = ctx.sh, a = ctx.args.filter(x => x !== '-n');
+  if (!sh.dirStack.length) { ctx.err('bash: popd: directory stack empty\n'); return 1; }
+  if (/^[+-]\d+$/.test(a[0] ?? '')) {
+    const all = [sh.cwd, ...sh.dirStack];
+    const n = +a[0].slice(1), k = a[0][0] === '+' ? n : all.length - 1 - n;
+    if (k < 0 || k >= all.length) { ctx.err(`bash: popd: ${a[0]}: directory stack index out of range\n`); return 1; }
+    if (k === 0) { if (!changeDir(ctx, sh.dirStack[0], 'popd')) return 1; sh.dirStack.shift(); }
+    else sh.dirStack.splice(k - 1, 1);
+  } else {
+    if (!changeDir(ctx, sh.dirStack[0], 'popd')) return 1;
+    sh.dirStack.shift();
+  }
+  printDirs(ctx);
+};
+
+// ---------- jobs (background jobs finish at once in HackTerm) ----------
+
+const findJob = (sh, spec) => {
+  if (spec === undefined || spec === '%' || spec === '%%' || spec === '%+') return sh.jobs[sh.jobs.length - 1];
+  if (/^%\d+$/.test(spec)) return sh.jobs.find(j => j.n === +spec.slice(1));
+  if (spec.startsWith('%')) return sh.jobs.find(j => j.cmd.startsWith(spec.slice(1)));
+  return undefined;
+};
+commands.jobs = ctx => {
+  const sh = ctx.sh, f = ctx.args.join('');
+  if (f.includes('p')) { for (const j of sh.jobs) ctx.out(j.pid + '\n'); return; }
+  sh.reportJobs(ctx.io, () => true, f.includes('l'), ctx.out);
+};
+commands.wait = ctx => {
+  const sh = ctx.sh;
+  let code = 0;
+  for (const a of ctx.args.filter(x => x !== '-n')) {
+    if (a.startsWith('%')) {
+      const j = findJob(sh, a);
+      if (!j) { ctx.err(`bash: wait: ${a}: no such job\n`); code = 127; continue; }
+      code = j.code;
+    } else if (/^\d+$/.test(a)) {
+      if (!sh.jobCodes.has(+a)) { ctx.err(`bash: wait: pid ${a} is not a child of this shell\n`); code = 127; continue; }
+      code = sh.jobCodes.get(+a);
+    } else { ctx.err(`bash: wait: \`${a}': not a pid or valid job spec\n`); code = 2; }
+  }
+  return code;
+};
+commands.fg = commands.bg = ctx => {
+  const j = findJob(ctx.sh, ctx.args[0]);
+  if (!j) { ctx.err(`bash: ${ctx.name}: ${ctx.args[0] ?? 'current'}: no such job\n`); return 1; }
+  ctx.err(`bash: ${ctx.name}: job has terminated\n`);
+  ctx.sh.jobs = ctx.sh.jobs.filter(x => x !== j);
+  ctx.err(`[${j.n}]+  ${(j.code ? `Exit ${j.code}` : 'Done').padEnd(24)}${j.cmd}\n`);
+  return 1;
+};
+
+// type shows a function's source.
+const typeCmd = commands.type;
+commands.type = ctx => {
+  const sh = ctx.sh;
+  for (const n of ctx.args) {
+    if (!Object.hasOwn(sh.aliases, n) && Object.hasOwn(sh.funcs, n)) ctx.out(`${n} is a function\n${funcText(n, sh.funcs[n])}`);
+    else {
+      const sub = { ...ctx, args: [n], fail: 0 };
+      typeCmd(sub);
+      if (sub.fail) ctx.fail = 1;
+    }
+  }
+};
+
+Object.assign(MAN, {
+  declare: ['declare [-aifFgprx] [NAME[=WERT]...]', 'Setzt Variablen mit Eigenschaften: -a Array, -i Ganzzahl (Zuweisungen werden gerechnet), -r schreibgeschuetzt, -x exportiert. -p zeigt Variablen, -f/-F zeigt Funktionen. In Funktionen sind die Variablen lokal. typeset ist dasselbe.', ['declare -i n=5*4; echo $n', 'declare -a ziele=(web01 db01); declare -p ziele', 'declare -F'], 'Skripte'],
+  readonly: ['readonly NAME[=WERT]...', 'Macht Variablen schreibgeschuetzt - Aendern und unset schlagen fehl.', ['readonly KEY=geheim; KEY=neu'], 'Skripte'],
+  set: ['set [-eux] [-o pipefail] [-- ARG...]', 'Shell-Optionen: -e bricht beim ersten Fehler ab, -u meckert ueber leere Variablen, -x zeigt jeden Befehl (+ ...), -o pipefail laesst Pipes scheitern, wenn ein Teil scheitert. set -- a b c setzt $1 $2 $3. +e usw. schaltet aus.', ['set -x; echo $HOME; set +x', 'set -- rot gruen; echo $2', 'set -o pipefail; false | true; echo $?'], 'Skripte'],
+  mapfile: ['mapfile [-t] [-n N] [-s N] [ARRAY]', 'Liest alle Zeilen von stdin in ein Array (Standard: MAPFILE). -t entfernt den Zeilenumbruch. readarray ist dasselbe.', ['mapfile -t zeilen < notes.txt; echo ${#zeilen[@]} Zeilen', 'ls | readarray -t dateien'], 'Skripte'],
+  getopts: ['getopts OPTSTRING NAME [ARG...]', 'Wertet Optionen wie -v -f datei aus, meist in einer while-Schleife. Ein : nach dem Buchstaben heisst "braucht ein Argument" ($OPTARG).', ['f() { while getopts "vf:" o; do echo "$o $OPTARG"; done; }; f -v -f log'], 'Skripte'],
+  trap: ['trap BEFEHL SIGNAL...', 'Fuehrt BEFEHL aus, wenn ein Signal kommt. EXIT laeuft am Ende eines Skripts, ERR nach jedem fehlgeschlagenen Befehl. trap - SIG entfernt, trap -p zeigt, trap -l listet Signale.', ["trap 'echo Aufraeumen' EXIT", "trap 'echo Fehler: $?' ERR; false"], 'Skripte'],
+  pushd: ['pushd [VERZ]   popd   dirs [-v]', 'Verzeichnis-Stapel: pushd wechselt und merkt sich das alte Verzeichnis, popd springt zurueck, dirs zeigt den Stapel.', ['pushd /var/log; pushd /etc; dirs -v; popd; popd'], 'Skripte'],
+  jobs: ['BEFEHL &   jobs   wait [PID]', 'Startet einen Befehl im Hintergrund ($! ist seine PID). In HackTerm sind Hintergrund-Jobs sofort fertig; jobs zeigt sie, wait liefert ihren Exit-Code.', ['sleep 1 & echo PID $!; wait $!', 'false & wait $!; echo $?'], 'Skripte'],
+  unset: ['unset [-fv] NAME...', 'Loescht Variablen, Array-Elemente (unset arr[1]) oder Funktionen (-f).', ['x=1; unset x; echo "[$x]"', 'a=(1 2 3); unset a[1]; echo ${a[@]}'], 'Shell'],
+});
+for (const k of ['typeset']) MAN[k] = MAN.declare;
+for (const k of ['readarray']) MAN[k] = MAN.mapfile;
+for (const k of ['popd', 'dirs']) MAN[k] = MAN.pushd;
+for (const k of ['wait', 'fg', 'bg']) MAN[k] = MAN.jobs;
 
 Object.assign(MAN, {
   if: ['if BEDINGUNG; then ...; [elif ...; then ...;] [else ...;] fi', 'Fuehrt Befehle nur aus, wenn die Bedingung (ein Befehl!) Exit-Code 0 liefert. Meist mit [ ... ] oder [[ ... ]].', ['if [ -f notes.txt ]; then echo da; else echo weg; fi', 'if grep -q Failed logs/auth.log; then echo Angriff; fi'], 'Skripte'],

@@ -12,9 +12,14 @@ Pure HTML/CSS/JavaScript web app (PWA), no build step and no dependencies.
   with `local`/`return`, `break`/`continue`, `read` (`while read ...; done < file`), here-documents `<<EOF`,
   here-strings `<<<`, `[[ ... ]]`, `(( ... ))`, subshells `( ... )` and groups `{ ...; }`. Unfinished input
   continues on a `> ` prompt; runaway loops and recursion are stopped by a step, loop and time budget.
+- **Parameter expansion & arrays**: `${v:-default}` `${v:=x}` `${v:?msg}` `${v:+x}`, `${f%.gz}` `${p##*/}`,
+  `${v/old/new}` `${v:1:3}` `${v^^}` `${#v}` `${!ref}`; indexed arrays `a=(x y)`, `a+=(z)`, `"${a[@]}"`,
+  `${#a[@]}`, `${!a[@]}`, `unset a[1]`. Builtins `declare`/`typeset` (`-a -i -r -x -p -f`), `readonly`,
+  `set -e -u -x -o pipefail` and `set --`, `printf -v`, `mapfile`/`readarray`, `read -a`, `getopts`,
+  `trap` (`EXIT`, `ERR`), `pushd`/`popd`/`dirs`, background jobs `cmd &` with `$!`, `jobs`, `wait`.
 - **Simulated filesystem** with Unix permissions (rwx, owner/group), symlinks, `/etc`, `/var/log`,
   `/root` (root only), `/proc` ... Saved in `localStorage`.
-- **~150 commands** with real options and real error messages: `ls cd cat grep sed awk find sort uniq
+- **~170 commands** with real options and real error messages: `ls cd cat grep sed awk find sort uniq
   cut tr wc head tail xargs tee diff tar chmod sudo ps kill base64 curl ping nano` and more.
   awk is a real little interpreter (arrays, `for`, `if`, `printf`, `BEGIN/END`, regex).
 - **Text, hashes and archives**: `paste comm column fold shuf expr factor`, `md5sum sha1sum sha256sum`
