@@ -152,7 +152,7 @@ export const MISSIONS = [
     check: sh => !sh.procs.some(p => p.pid === 902) },
   // --- Chapter 7: parameter expansion, arrays and robust scripts ---
   { ch: 6, xp: 70, title: 'Endungen kappen',
-    intro: 'Die Box ist dicht. Doch der naechste Einsatz kommt bestimmt - und dann zaehlt jede Sekunde. Zeit fuer ein Werkzeugset, wie es die Profis haben: Skripte, die Namen zerlegen, Listen abarbeiten und sauber scheitern.',
+    intro: 'Die Box ist dicht. Doch der naechste Einsatz kommt bestimmt - und dann zaehlt jede Sekunde. Zeit fuer ein Werkzeugset, wie es die Profis haben: Skripte, die Namen zerlegen, Listen abarbeiten und sauber scheitern.\nTipp: Die Taste #+= in der Leiste unten blendet ${} [@] { } [ ] ( ) ; # % = ein.',
     brief: 'Profis tippen Dateinamen nicht ab, sie schneiden sie zurecht. Gib fuer jede Datei in logs/*.log nur den nackten Namen aus - ohne "logs/" und ohne ".log". Nutze ${variable##muster} und ${variable%muster}.',
     hint: 'for f in logs/*.log; do n=${f##*/}; echo ${n%.log}; done   (## schneidet vorne das Laengste ab, % hinten das Kuerzeste)',
     check: (sh, r) => /\$\{\w+(%|#)/.test(r.line) && ['auth', 'access'].every(n => r.stdout.split(/\s+/).includes(n)) && !/\.log|logs\//.test(r.stdout),

@@ -1,5 +1,5 @@
 // Offline cache for the app shell. Bump VERSION whenever files change.
-const VERSION = 'hackterm-v6';
+const VERSION = 'hackterm-v7';
 const FILES = [
   './', 'index.html', 'manifest.webmanifest', 'css/style.css',
   'js/app.js', 'js/shell.js', 'js/vfs.js', 'js/commands.js', 'js/awk.js', 'js/game.js', 'js/world.js', 'js/more.js',

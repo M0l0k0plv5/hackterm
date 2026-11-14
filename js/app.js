@@ -391,11 +391,24 @@ function ctrlC() {
   renderPrompt();
   scrollDown();
 }
-function insertText(t) {
+// back: how far the cursor moves back after inserting (pairs like ${} put it inside).
+// A selection is wrapped by such a pair instead of being replaced.
+function insertText(t, back = 0) {
   const s = input.selectionStart ?? input.value.length, e = input.selectionEnd ?? s;
-  input.value = input.value.slice(0, s) + t + input.value.slice(e);
-  input.setSelectionRange(s + t.length, s + t.length);
+  const sel = input.value.slice(s, e);
+  const text = back && sel ? t.slice(0, t.length - back) + sel + t.slice(t.length - back) : t;
+  input.value = input.value.slice(0, s) + text + input.value.slice(e);
+  const p = s + text.length - back;
+  input.setSelectionRange(p, p);
 }
+const keysBar = $('keys');
+function toggleSymbols(on = !keysBar.classList.contains('alt')) {
+  keysBar.classList.toggle('alt', on);
+  $('sym').setAttribute('aria-pressed', String(on));
+  $('sym').textContent = on ? 'abc' : '#+=';
+  try { localStorage.setItem('hackterm-keys', on ? 'alt' : ''); } catch { /* storage unavailable */ }
+}
+try { if (localStorage.getItem('hackterm-keys') === 'alt') toggleSymbols(true); } catch { /* storage unavailable */ }
 function moveCursor(d) {
   const p = Math.max(0, Math.min(input.value.length, (input.selectionStart ?? 0) + d));
   input.setSelectionRange(p, p);
@@ -424,9 +437,9 @@ $('keys').addEventListener('pointerdown', e => {
   if (!b) return;
   e.preventDefault();
   if (document.activeElement !== input) input.focus();
-  if (b.dataset.i) insertText(b.dataset.i);
+  if (b.dataset.i) insertText(b.dataset.i, +(b.dataset.c || 0));
   else ({
-    tab: complete, up: () => historyNav(-1), down: () => historyNav(1),
+    sym: () => toggleSymbols(), tab: complete, up: () => historyNav(-1), down: () => historyNav(1),
     left: () => moveCursor(-1), right: () => moveCursor(1), ctrlc: ctrlC, ctrll: clearScreen,
   })[b.dataset.k]?.();
 });

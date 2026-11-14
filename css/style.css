@@ -86,6 +86,10 @@ body[data-theme="green"] .c-green.b { color: #7dffa0; }
   color: var(--fg); text-shadow: 0 0 5px var(--glow); font-size: 15px; touch-action: manipulation;
 }
 #keys button:active { background: var(--fg); color: var(--bg); text-shadow: none; }
+/* Two symbol sets share one row: the plain shell set and the scripting set (#+=). */
+#keys:not(.alt) button[data-set="b"] { display: none; }
+#keys.alt button[data-i]:not([data-set]) { display: none; }
+#keys #sym[aria-pressed="true"] { border-color: var(--fg); background: color-mix(in srgb, var(--fg) 20%, transparent); }
 
 /* ---- nano editor ---- */
 #editor {
