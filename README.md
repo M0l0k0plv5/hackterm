@@ -28,8 +28,8 @@ Pure HTML/CSS/JavaScript web app (PWA), no build step and no dependencies.
   Stopping a service really removes its process and its listening port.
 - **Simulated network toolbox**: `nmap nc host nslookup dig traceroute netstat ss lsof`. Nothing leaves
   the browser; the hosts, ports and sockets match the story (e.g. the miner's connection to darknode).
-- **Gamification**: 35 missions in 6 chapters with a story (attacker in the logs, crypto miner,
-  root flag, then scanning back, automating and locking the attacker out), XP, 8 ranks, 11 achievements, `hint`, `stats`, `missions`.
+- **Gamification**: 43 missions in 7 chapters with a story (attacker in the logs, crypto miner,
+  root flag, then scanning back, automating and locking the attacker out, finally a scripting toolkit), XP, 9 ranks, 14 achievements, `hint`, `stats`, `missions`.
 - **Hacker look**: CRT scanlines, glow, boot sequence, `cmatrix`, themes (`theme amber|cyan|red|mono`).
 - **iPhone**: special-key bar (TAB, arrows, `| > ~ * $` ...), keyboard-aware layout, safe areas,
   "Add to Home Screen" for fullscreen and offline use (service worker).

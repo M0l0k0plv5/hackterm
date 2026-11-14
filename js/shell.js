@@ -1759,6 +1759,13 @@ commands.set = ctx => {
     }
     if (/^[-+][A-Za-z]+$/.test(a)) {
       for (const c of a.slice(1)) {
+        if (c === 'o') {
+          // -euo pipefail: the option name is the next argument.
+          const name = args[++i];
+          if (!Object.hasOwn(SET_LONG, name ?? '')) { ctx.err(`bash: set: ${name ?? ''}: invalid option name\n`); return 2; }
+          sh.opts[name] = a[0] === '-';
+          continue;
+        }
         if (!short[c]) { ctx.err(`bash: set: ${a[0]}${c}: invalid option\nset: usage: set [-eux] [-o errexit|nounset|xtrace|pipefail] [--] [arg ...]\n`); return 2; }
         sh.opts[short[c]] = a[0] === '-';
       }

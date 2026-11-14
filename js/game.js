@@ -12,10 +12,10 @@ const showsHidden = out => out.split(/\s+/).some(w => /^\.[^.\s/]/.test(w) || /^
 
 export const RANKS = [
   [0, 'Script Kiddie'], [150, 'Rookie'], [450, 'Operator'], [800, 'Sysadmin'],
-  [1200, 'Hacker'], [1700, 'Elite'], [2000, 'Root'], [2600, 'Ghost'],
+  [1200, 'Hacker'], [1700, 'Elite'], [2000, 'Root'], [2600, 'Ghost'], [3300, 'Legende'],
 ];
 
-export const CHAPTERS = ['Orientierung', 'Dateien', 'Lesen & Suchen', 'Pipes & Umleitung', 'Rechte & System', 'Automatisierung & Abwehr'];
+export const CHAPTERS = ['Orientierung', 'Dateien', 'Lesen & Suchen', 'Pipes & Umleitung', 'Rechte & System', 'Automatisierung & Abwehr', 'Skript-Profi'];
 
 export const MISSIONS = [
   // --- Chapter 1 ---
@@ -150,6 +150,71 @@ export const MISSIONS = [
     brief: 'Der Angreifer kam ueber das Web-Login (logs/access.log: "POST /login" mit Status 200). Stoppe den Webserver nginx und pruefe, dass Port 80 nicht mehr lauscht.',
     hint: 'sudo systemctl stop nginx && ss -tln',
     check: sh => !sh.procs.some(p => p.pid === 902) },
+  // --- Chapter 7: parameter expansion, arrays and robust scripts ---
+  { ch: 6, xp: 70, title: 'Endungen kappen',
+    intro: 'Die Box ist dicht. Doch der naechste Einsatz kommt bestimmt - und dann zaehlt jede Sekunde. Zeit fuer ein Werkzeugset, wie es die Profis haben: Skripte, die Namen zerlegen, Listen abarbeiten und sauber scheitern.',
+    brief: 'Profis tippen Dateinamen nicht ab, sie schneiden sie zurecht. Gib fuer jede Datei in logs/*.log nur den nackten Namen aus - ohne "logs/" und ohne ".log". Nutze ${variable##muster} und ${variable%muster}.',
+    hint: 'for f in logs/*.log; do n=${f##*/}; echo ${n%.log}; done   (## schneidet vorne das Laengste ab, % hinten das Kuerzeste)',
+    check: (sh, r) => /\$\{\w+(%|#)/.test(r.line) && ['auth', 'access'].every(n => r.stdout.split(/\s+/).includes(n)) && !/\.log|logs\//.test(r.stdout),
+    nudge: (sh, r) => (used(r, 'basename') && !/\$\{\w+(%|#)/.test(r.line) ? 'basename geht auch - aber schaffst du es nur mit ${f##*/} und ${f%.log}?' : null) },
+  { ch: 6, xp: 70, title: 'Zielliste',
+    brief: 'Statt Rechner einzeln zu tippen, legst du sie in ein Array. Speichere localhost, darknode.local und example.com im Array ziele und gib aus, wie viele Eintraege es hat.',
+    hint: 'ziele=(localhost darknode.local example.com); echo ${#ziele[@]}',
+    check: (sh, r) => {
+      const items = (sh.arrays.ziele || []).filter(v => v !== null && v !== undefined);
+      return ['localhost', 'darknode.local', 'example.com'].every(h => items.includes(h))
+        && /\$\{#ziele\[[@*]\]\}/.test(r.line) && r.stdout.split(/\s+/).includes(String(items.length));
+    } },
+  { ch: 6, xp: 80, title: 'Rundum-Scan',
+    brief: 'Pruefe jetzt mit EINER Schleife ueber "${ziele[@]}", auf welchen Zielen Port 22 (SSH) offen ist - mit nc -zv.',
+    hint: 'for z in "${ziele[@]}"; do nc -zv $z 22; done',
+    check: (sh, r) => used(r, 'for') && /\$\{ziele\[[@*]\]\}/.test(r.line) && r.cmds.filter(c => c.name === 'nc' || c.name === 'nmap').length >= 3,
+    nudge: (sh, r) => (used(r, 'nc') && !/\$\{ziele\[[@*]\]\}/.test(r.line) ? 'Lass die Schleife ueber "${ziele[@]}" laufen, statt die Rechner abzutippen.' : null) },
+  { ch: 6, xp: 80, title: 'Alles auf einmal',
+    brief: 'mapfile liest eine ganze Datei in ein Array, eine Zeile pro Element. Lies logs/auth.log in das Array zeilen und gib aus, wie viele Zeilen es sind und was in der letzten steht.',
+    hint: 'mapfile -t zeilen < logs/auth.log; echo ${#zeilen[@]}; echo "${zeilen[-1]}"',
+    check: (sh, r) => {
+      if (!used(r, 'mapfile') && !used(r, 'readarray')) return false;
+      const f = node(sh, `${HOME}/logs/auth.log`);
+      if (!f || f.t !== 'f') return false;
+      const lines = f.d.split('\n').filter((l, i, a) => i < a.length - 1 || l);
+      return r.stdout.split(/\s+/).includes(String(lines.length)) && r.stdout.includes(lines[lines.length - 1]);
+    } },
+  { ch: 6, xp: 90, title: 'Werkzeug mit Optionen',
+    brief: 'Echte Tools haben Optionen. Baue eine Funktion scan, die mit getopts die Option -p PORT versteht und dann nmap -p PORT auf ihr Ziel anwendet. Teste: scan -p 22 darknode.local',
+    hint: 'scan() { local OPTIND p=80; while getopts "p:" o; do p=$OPTARG; done; shift $((OPTIND-1)); nmap -p $p "$1"; }; scan -p 22 darknode.local',
+    check: (sh, r) => ran(r, 'getopts') && r.cmds.some(c => c.func && c.code === 0)
+      && r.cmds.some(c => c.name === 'nmap' && c.args.includes('darknode.local') && c.args.some(a => /^(-p)?22$/.test(a))) },
+  { ch: 6, xp: 80, title: 'Spuren verwischen',
+    brief: 'Ein sauberes Skript raeumt hinter sich auf, auch wenn es abbricht. Starte mit bash -c ein Mini-Skript, das /tmp/spur anlegt und per trap ... EXIT beim Beenden wieder loescht.',
+    hint: `bash -c "trap 'rm -f /tmp/spur; echo aufgeraeumt' EXIT; touch /tmp/spur; ls /tmp"`,
+    check: (sh, r) => {
+      const t = r.cmds.findIndex(c => c.name === 'trap' && c.code === 0 && c.args.some(a => /^(EXIT|SIGEXIT|0)$/i.test(a)));
+      if (t < 0 || !r.cmds.some((c, i) => i > t && c.name === 'rm' && c.code === 0)) return false;
+      const touched = r.cmds.filter(c => c.name === 'touch').flatMap(c => c.args);
+      return touched.every(a => !node(sh, a.startsWith('/') ? a : `${sh.cwd}/${a}`));
+    } },
+  { ch: 6, xp: 80, title: 'Strenger Modus',
+    brief: 'Mit set -euo pipefail bricht ein Skript beim ersten Fehler ab, statt mit Muell weiterzumachen. Beweise es: Starte bash -c mit set -euo pipefail, greife auf eine nicht gesetzte Variable zu und gib danach noch etwas aus - das darf nicht mehr erscheinen.',
+    hint: `bash -c 'set -euo pipefail; echo start; echo $NICHTDA; echo NIE'`,
+    check: (sh, r) => {
+      const flags = r.cmds.filter(c => c.name === 'set' && c.code === 0).flatMap(c => c.args);
+      const has = ch => flags.some(a => new RegExp(`^-\\w*${ch}`).test(a));
+      return has('e') && has('u') && flags.includes('pipefail') && r.cmds.some(c => (c.name === 'bash' || c.name === 'sh' || c.script) && c.code !== 0);
+    },
+    nudge: (sh, r) => (sh.opts.errexit && !r.cmds.some(c => c.name === 'bash' || c.script)
+      ? "Achtung: set -e gilt jetzt fuer deine ganze Shell (ausschalten: set +euo pipefail). Fuer die Mission: bash -c '...'" : null) },
+  { ch: 6, xp: 120, title: 'Der Bericht', finale: 'AUFTRAG ERFUELLT',
+    brief: 'Letzter Auftrag: Schreibe einen Bericht nach report.txt (in deinem Home). Zeile 1: "Ziele: " und alle Eintraege aus ziele. Zeile 2: "Angriffe: " und die Zahl der Failed-Logins aus logs/auth.log.',
+    hint: '{ echo "Ziele: ${ziele[*]}"; echo "Angriffe: $(grep -c Failed logs/auth.log)"; } > report.txt; cat report.txt',
+    check: sh => {
+      const f = node(sh, `${HOME}/report.txt`);
+      if (!f || f.t !== 'f') return false;
+      const log = node(sh, `${HOME}/logs/auth.log`);
+      const n = log && log.t === 'f' ? log.d.split('\n').filter(l => l.includes('Failed')).length : null;
+      const m = /Angriffe:\s*(\d+)/.exec(f.d);
+      return /Ziele:.*darknode\.local/.test(f.d) && !!m && (n === null || +m[1] === n);
+    } },
 ];
 
 export const ACHIEVEMENTS = [
@@ -164,6 +229,9 @@ export const ACHIEVEMENTS = [
   { id: 'century', name: 'Tastaturheld', desc: '100 Befehle eingegeben', test: g => g.s.cmds >= 100 },
   { id: 'loop', name: 'Schleifenmeister', desc: 'Eine Schleife geschrieben', test: (g, sh, r) => r.cmds.some(c => ['for', 'while', 'until'].includes(c.name)) },
   { id: 'func', name: 'Werkzeugmacher', desc: 'Eine eigene Funktion aufgerufen', test: (g, sh, r) => r.cmds.some(c => c.func && c.code === 0) },
+  { id: 'array', name: 'Listenprofi', desc: 'Ein Array angelegt', test: (g, sh, r) => /(^|[\s;&|({])[A-Za-z_]\w*\+?=\(/.test(r.line) && Object.keys(sh.arrays).length > 0 },
+  { id: 'expand', name: 'Skalpell', desc: 'Parameter-Expansion benutzt', test: (g, sh, r) => r.cmds.length > 0 && /\$\{[A-Za-z_]\w*(\[[^\]]*\])?(:?[-=?+]|##?|%%?|\/|\^|,|:-?\d)/.test(r.line) },
+  { id: 'strict', name: 'Kugelsicher', desc: 'set -e eingeschaltet', test: (g, sh, r) => r.cmds.some(c => c.name === 'set' && c.code === 0 && c.args.some(a => /^-\w*e/.test(a) || a === 'errexit')) },
 ];
 const ACH_XP = 25;
 const META = new Set(['mission', 'hint', 'missions', 'stats', 'help', 'theme', 'reset']);

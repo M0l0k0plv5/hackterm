@@ -532,6 +532,28 @@ t('declare -f source', 'f() { echo $1; }; declare -f f', 'f () { echo $1; }\n');
   if (out === '/home/hacker/keep\ndata\n1\n') pass++; else { fail++; console.log('FAIL persistence', JSON.stringify(out)); }
 }
 
+// --- chapter 7 missions must not accept near misses ---
+{
+const first = MISSIONS.findIndex(m => m.ch === 6);
+const cases = [
+  [0, 'ls logs', false], [0, 'for f in logs/*.log; do basename $f .log; done', false], [0, 'for f in logs/*.log; do basename ${f%.log}; done', true],
+  [1, 'ziele=(localhost darknode.local example.com)', false], [1, 'ziele=(localhost darknode.local example.com box); echo ${#ziele[@]}', true],
+  [2, 'for z in localhost darknode.local example.com; do nc -zv $z 22; done', false],
+  [3, 'wc -l logs/auth.log; tail -1 logs/auth.log', false], [3, 'readarray z < logs/auth.log; echo ${#z[@]} "${z[@]: -1}"', true],
+  [4, 'nmap -p 22 darknode.local', false],
+  [5, "bash -c \"trap 'echo bye' EXIT; touch /tmp/spur\"", false],
+  [6, "bash -c 'set -euo pipefail; echo ok'", false], [6, "set -euo pipefail; echo $NIX", false],
+  [7, 'echo "Ziele: x" > report.txt', false], [7, 'printf "Ziele: %s\\nAngriffe: 3\\n" "${ziele[*]}" > report.txt', false],
+];
+  for (const [k, line, want] of cases) {
+    const sh = mk();
+    exec(sh, 'ziele=(localhost darknode.local example.com)');
+    const g = new Game({ idx: first + k });
+    const got = g.afterRun(sh, exec(sh, line).run).some(e => e.type === 'mission');
+    if (got === want) pass++; else { fail++; console.log(`FAIL mission check "${MISSIONS[first + k].title}": ${line} -> ${got}`); }
+  }
+}
+
 // --- full mission walkthrough using each mission's hint solution ---
 {
   const sh = mk();
@@ -550,6 +572,12 @@ t('declare -f source', 'f() { echo $1; }; declare -f f', 'f () { echo $1; }\n');
     'grep Failed logs/auth.log | while read monat tag zeit rest; do echo $zeit; done',
     'portscan() { nmap "$1"; }; portscan darknode.local', 'sha256sum tools/scan.sh > tools.sha256 && sha256sum -c tools.sha256',
     'echo "*/5 * * * * $HOME/tools/scan.sh" > job.txt && crontab job.txt && crontab -l', 'sudo systemctl stop nginx && ss -tln',
+    'for f in logs/*.log; do n=${f##*/}; echo ${n%.log}; done', 'ziele=(localhost darknode.local example.com); echo ${#ziele[@]}',
+    'for z in "${ziele[@]}"; do nc -zv $z 22; done', 'mapfile -t zeilen < logs/auth.log; echo ${#zeilen[@]}; echo "${zeilen[-1]}"',
+    'scan() { local OPTIND p=80; while getopts "p:" o; do p=$OPTARG; done; shift $((OPTIND-1)); nmap -p $p "$1"; }; scan -p 22 darknode.local',
+    `bash -c "trap 'rm -f /tmp/spur; echo aufgeraeumt' EXIT; touch /tmp/spur; ls /tmp"`,
+    `bash -c 'set -euo pipefail; echo start; echo $NICHTDA; echo NIE'`,
+    '{ echo "Ziele: ${ziele[*]}"; echo "Angriffe: $(grep -c Failed logs/auth.log)"; } > report.txt; cat report.txt',
   ];
   let ok = solutions.length === MISSIONS.length;
   solutions.forEach((line, i) => {
