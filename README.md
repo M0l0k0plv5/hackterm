@@ -8,6 +8,10 @@ Pure HTML/CSS/JavaScript web app (PWA), no build step and no dependencies.
 - **Real shell semantics**: pipes `|`, redirections `> >> < 2> 2>&1 &>`, `&& || ;`,
   variables, `$(...)`, backticks, `$((...))`, globs `* ? [..]`, brace expansion `{a,b} {1..5}`,
   quoting, aliases, history `!!`, tab completion, scripts with `$1`, `./script.sh` and the execute bit.
+- **Scripting**: `if/elif/else`, `for` (also `for ((i=0; i<3; i++))`), `while`, `until`, `case`, functions
+  with `local`/`return`, `break`/`continue`, `read` (`while read ...; done < file`), here-documents `<<EOF`,
+  here-strings `<<<`, `[[ ... ]]`, `(( ... ))`, subshells `( ... )` and groups `{ ...; }`. Unfinished input
+  continues on a `> ` prompt; runaway loops and recursion are stopped by a step, loop and time budget.
 - **Simulated filesystem** with Unix permissions (rwx, owner/group), symlinks, `/etc`, `/var/log`,
   `/root` (root only), `/proc` ... Saved in `localStorage`.
 - **~150 commands** with real options and real error messages: `ls cd cat grep sed awk find sort uniq
@@ -19,8 +23,8 @@ Pure HTML/CSS/JavaScript web app (PWA), no build step and no dependencies.
   Stopping a service really removes its process and its listening port.
 - **Simulated network toolbox**: `nmap nc host nslookup dig traceroute netstat ss lsof`. Nothing leaves
   the browser; the hosts, ports and sockets match the story (e.g. the miner's connection to darknode).
-- **Gamification**: 26 missions in 5 chapters with a story (attacker in the logs, crypto miner,
-  root flag), XP, 7 ranks, 9 achievements, `hint`, `stats`, `missions`.
+- **Gamification**: 35 missions in 6 chapters with a story (attacker in the logs, crypto miner,
+  root flag, then scanning back, automating and locking the attacker out), XP, 8 ranks, 11 achievements, `hint`, `stats`, `missions`.
 - **Hacker look**: CRT scanlines, glow, boot sequence, `cmatrix`, themes (`theme amber|cyan|red|mono`).
 - **iPhone**: special-key bar (TAB, arrows, `| > ~ * $` ...), keyboard-aware layout, safe areas,
   "Add to Home Screen" for fullscreen and offline use (service worker).

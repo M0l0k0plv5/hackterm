@@ -691,7 +691,24 @@ commands.printf = ctx => {
 };
 
 commands.grep = commands.egrep = commands.fgrep = ctx => {
-  const { o, rest } = opts(ctx, 'ivnclrRwoEFqHhs', 'eABC', {
+  // Collect every -e PATTERN first: opts() keeps only the last value of an option.
+  const pats = [], args = [];
+  for (let i = 0; i < ctx.args.length; i++) {
+    const x = ctx.args[i];
+    if (x === '--') { args.push(...ctx.args.slice(i)); break; }
+    const m = /^-([ivnclrRwoEFqHhs]*)e(.*)$/.exec(x);
+    if (m) {
+      if (m[1]) args.push('-' + m[1]);
+      if (m[2]) pats.push(m[2]);
+      else if (i + 1 < ctx.args.length) pats.push(ctx.args[++i]);
+      else throw new Usage("option requires an argument -- 'e'");
+      continue;
+    }
+    if (x.startsWith('--regexp=')) { pats.push(x.slice(9)); continue; }
+    if (x === '--regexp' && i + 1 < ctx.args.length) { pats.push(ctx.args[++i]); continue; }
+    args.push(x);
+  }
+  const { o, rest } = opts({ args }, 'ivnclrRwoEFqHhs', 'ABC', {
     '--color': '_', '--ignore-case': 'i', '--invert-match': 'v', '--line-number': 'n', '--count': 'c',
     '--recursive': 'r', '--extended-regexp': 'E', '--fixed-strings': 'F', '--quiet': 'q',
     '--after-context': 'A', '--before-context': 'B', '--context': 'C',
@@ -700,14 +717,17 @@ commands.grep = commands.egrep = commands.fgrep = ctx => {
   const after = ctxN(o.A ?? o.C), before = ctxN(o.B ?? o.C);
   if (ctx.name === 'egrep') o.E = true;
   if (ctx.name === 'fgrep') o.F = true;
-  let pat = o.e;
   const files = [...rest];
-  if (pat === undefined) {
+  if (!pats.length) {
     if (!files.length) throw new Usage('Usage: grep [OPTION]... PATTERNS [FILE]...');
-    pat = files.shift();
+    pats.push(files.shift());
   }
   let re;
-  try { re = toRegex(pat, { ext: o.E, fixed: o.F, icase: o.i, word: o.w }); } catch { ctx.err('grep: Invalid regular expression\n'); return 2; }
+  try {
+    // Several patterns (or a pattern with newlines) match if any of them matches.
+    const parts = pats.flatMap(p => p.split('\n')).map(p => toRegex(p, { ext: o.E, fixed: o.F, icase: o.i, word: o.w }));
+    re = parts.length === 1 ? parts[0] : new RegExp(parts.map(r => `(?:${r.source})`).join('|'), parts[0].flags);
+  } catch { ctx.err('grep: Invalid regular expression\n'); return 2; }
   const rec = o.r || o.R;
   const implicit = !files.length;
   if (implicit) files.push(rec ? '.' : '-');
@@ -1155,6 +1175,7 @@ commands.which = ctx => {
 commands.type = ctx => {
   for (const n of ctx.args) {
     if (Object.hasOwn(ctx.sh.aliases, n)) ctx.out(`${n} is aliased to \`${ctx.sh.aliases[n]}'\n`);
+    else if (Object.hasOwn(ctx.sh.funcs ?? {}, n)) ctx.out(`${n} is a function\n`);
     else if (BUILTINS.has(n)) ctx.out(`${n} is a shell builtin\n`);
     else if (commands[n]) ctx.out(`${n} is /usr/bin/${n}\n`);
     else { ctx.err(`bash: type: ${n}: not found\n`); ctx.fail = 1; }

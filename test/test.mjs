@@ -66,9 +66,20 @@ t('glob quoted', 'echo "*"', '*\n');
 t('tilde', 'echo ~ ~/x', '/home/hacker /home/hacker/x\n');
 t('comment', 'echo a # b', 'a\n');
 t('not found', 'foo', 'bash: foo: command not found\n', { err: true, code: 127 });
-t('syntax', 'echo a |', /syntax error/, { err: true, code: 2 });
+// Unfinished input waits for more lines (PS2 prompt "> "), like an interactive bash.
+{
+  const sh = mk();
+  const r1 = exec(sh, 'echo a |');
+  const p2 = sh.prompt();
+  const r2 = exec(sh, 'tr a b');
+  const r3 = exec(sh, 'echo "abc');
+  const r4 = exec(sh, 'def"');
+  if (r1.run.incomplete && p2 === '> ' && r2.out === 'b\n' && r3.run.incomplete && r4.out === 'abc\ndef\n' && sh.prompt() !== '> ') pass++;
+  else { fail++; console.log('FAIL continuation', JSON.stringify([r1.run, p2, r2.out, r3.run, r4.out])); }
+}
+t('syntax', 'echo a | | b', /syntax error/, { err: true, code: 2 });
 t('syntax2', '| ls', "bash: syntax error near unexpected token `|'\n", { err: true });
-t('unclosed', 'echo "abc', /unexpected EOF/, { err: true });
+t('unclosed subst', 'echo $(echo "abc)', /unexpected EOF/, { err: true });
 t('alias', 'alias hi="echo hello"; hi there', 'hello there\n');
 t('ll alias', 'll notes.txt', /^-rw-r--r-- 1 hacker/);
 t('history !!', '!!', 'echo one\none\n', { pre: ['echo one'], sh: undefined, }) ;
@@ -347,6 +358,106 @@ t('grep -B -n', 'grep -n -B1 date downloads/words.txt', '6-apple\n7:date\n');
 t('grep -C merge', 'seq 5 | grep -C1 -E "2|4"', '1\n2\n3\n4\n5\n');
 t('date tz', 'date +%Z', /^(CET|CEST|UTC|[A-Z]{2,5}|GMT[+-]\d+)\n$/);
 
+// --- control structures, functions, here-documents ---
+t('for', 'for i in 1 2 3; do echo "R$i"; done', 'R1\nR2\nR3\n');
+t('for glob', 'for f in *.txt; do echo $f; done', 'notes.txt\nreadme.txt\n');
+t('for brace', 'for i in {1..3}; do printf $i; done; echo', '123\n');
+t('for empty', 'for x in; do echo nope; done; echo ok', 'ok\n');
+t('for c-style', 'for ((i=0; i<3; i++)); do echo $i; done', '0\n1\n2\n');
+t('for multiline', 'for i in a b\ndo\n  echo $i\ndone', 'a\nb\n');
+t('while', 'i=0; while [ $i -lt 3 ]; do echo $i; i=$((i+1)); done', '0\n1\n2\n');
+t('until', 'n=0; until [ $n -ge 4 ]; do n=$((n+1)); done; echo $n', '4\n');
+t('if else', 'if [ -f nope ]; then echo a; else echo b; fi', 'b\n');
+t('if elif', 'if false; then echo a; elif [ 1 -eq 1 ]; then echo b; else echo c; fi', 'b\n');
+t('if status', 'if false; then echo a; fi; echo $?', '0\n');
+t('if cmd', 'if grep -q Failed logs/auth.log; then echo Angriff; fi', 'Angriff\n');
+t('case', 'case $USER in root) echo Chef;; hack*) echo Operator;; *) echo Gast;; esac', 'Operator\n');
+t('case alt', 'x=a.md; case $x in *.txt|*.md) echo text;; *) echo other;; esac', 'text\n');
+t('case quoted', 'x="*"; case abc in "$x") echo literal;; *) echo glob;; esac', 'glob\n');
+t('function', 'gruss() { echo "Hallo $1 ($#)"; }; gruss Neo Trinity', 'Hallo Neo (2)\n');
+t('function kw', 'function f { echo kw; }; f', 'kw\n');
+t('function type', 'f() { :; }; type f', 'f is a function\n');
+t('local', 'f() { local x=1; echo in$x; }; x=9; f; echo out$x', 'in1\nout9\n');
+t('return', 'f() { return 3; }; f; echo $?', '3\n');
+t('return outside', 'return', /can only `return'/, { err: true, code: 1 });
+t('recursion', 'fak() { if [ $1 -le 1 ]; then echo 1; else echo $(( $1 * $(fak $(( $1 - 1 ))) )); fi; }; fak 5', '120\n');
+t('break', 'for i in 1 2 3 4; do [ $i = 3 ] && break; echo $i; done', '1\n2\n');
+t('continue', 'for i in 1 2 3; do [ $i = 2 ] && continue; echo $i; done', '1\n3\n');
+t('continue 2', 'for i in 1 2; do for j in a b; do [ $j = b ] && continue 2; echo $i$j; done; done', '1a\n2a\n');
+t('break outside', 'break', /only meaningful/, { err: true });
+t('quoted at', 'f() { for a in "$@"; do echo "[$a]"; done; }; f "a b" c', '[a b]\n[c]\n');
+t('quoted at empty', 'f() { for a in "$@"; do echo x; done; echo done; }; f', 'done\n');
+t('shift', 'f() { shift; echo "$@"; }; f a b c', 'b c\n');
+t('unset -f', 'f() { echo hi; }; unset -f f; f', /f: command not found/, { err: true, code: 127 });
+t('read pipe', 'echo "Neo 42 extra" | { read name rest; echo "$name|$rest"; }', 'Neo|42 extra\n');
+t('read REPLY', 'echo "  x  " | { read -r; echo "[$REPLY]"; }', '[  x  ]\n');
+t('read tty', 'read x', /kann nicht auf Tastatureingaben warten/, { err: true, code: 1 });
+t('while read', 'while read -r l; do echo ">$l"; done < documents/todo.txt | head -n 2', '>milch kaufen\n>server patchen\n');
+t('while read IFS', 'while IFS=, read -r n a c; do echo $c; done < documents/contacts.csv | tail -n 1', 'Muenchen\n');
+t('while read pipe', 'grep Failed logs/auth.log | while read m d t rest; do echo $t; done | head -n 1', '08:20:11\n');
+t('while cat rest', 'printf "1\\n2\\n3\\n" | while read a; do cat; done', '2\n3\n');
+t('heredoc', 'cat <<EOF\nHallo $USER\n$(echo cmd)\nEOF', 'Hallo hacker\ncmd\n');
+t('heredoc quoted', "cat <<'EOF'\n$USER\nEOF", '$USER\n');
+t('heredoc strip', 'cat <<-EOF\n\tA\n\tEOF', 'A\n');
+t('herestring', 'tr a-z A-Z <<< "hallo"', 'HALLO\n');
+t('dbracket glob', '[[ $USER == hack* ]] && echo ja', 'ja\n');
+t('dbracket quoted', '[[ $USER == "hack*" ]] || echo nein', 'nein\n');
+t('dbracket logic', '[[ -f notes.txt && ! -d notes.txt ]] && echo ok', 'ok\n');
+t('dbracket regex', '[[ abc123 =~ [0-9]+ ]] && echo $BASH_REMATCH', '123\n');
+t('dbracket nosplit', 'x="a b"; [[ $x == "a b" ]] && echo eq', 'eq\n');
+t('arith cmd', 'x=1; ((x++)); ((x+=5)); echo $x; ((x > 100)) || echo klein', '7\nklein\n');
+t('let', 'let y=6*7; echo $y', '42\n');
+t('plus assign', 'a=x; a+=y; echo $a', 'xy\n');
+t('group redirect', '{ echo a; echo b; } > g.txt; cat g.txt', 'a\nb\n');
+t('loop pipe', 'for i in 3 1 2; do echo $i; done | sort', '1\n2\n3\n');
+t('loop redirect', 'for i in 1 2; do echo $i; done > l.txt; wc -l < l.txt', '2\n');
+t('subshell', '(cd /tmp; x=1; echo $PWD); echo $PWD $x', '/tmp\n/home/hacker\n');
+t('negate', '! false && echo neg', 'neg\n');
+t('nested', 'for i in 1 2; do if [ $i = 2 ]; then case $i in 2) echo zwei;; esac; fi; done', 'zwei\n');
+t('comment', 'echo a # kommentar\necho b', 'a\nb\n');
+t('syntax fi', 'fi', "bash: syntax error near unexpected token `fi'\n", { err: true, code: 2 });
+t('syntax done', 'for i in 1; do echo; done done', /syntax error/, { err: true, code: 2 });
+t('keyword quoted', '"if"', /if: command not found/, { err: true, code: 127 });
+t('loop limit', 'while true; do :; done', /mehr als 10000 Schleifendurchlaeufe/, { err: true, code: 130 });
+t('loop limit pipe', 'while true; do echo y; done | head -n 2', 'y\ny\n');
+t('recursion limit', 'f() { f; }; f', /maximum function nesting level exceeded/, { err: true, code: 130 });
+{
+  // A fork bomb must stop quickly and without flooding the screen.
+  const sh = mk();
+  const t0 = Date.now();
+  const r = exec(sh, ':(){ :|:& };:');
+  const ms = Date.now() - t0;
+  if (r.code === 130 && ms < 2000 && r.err.split('\n').length < 5) pass++;
+  else { fail++; console.log('FAIL fork bomb', r.code, ms, r.err.slice(0, 200)); }
+}
+{
+  // Scripts may span several lines and use functions, loops and positional parameters.
+  const sh = mk();
+  exec(sh, `printf '#!/bin/bash\\nzaehle() {\\n  local n=0\\n  for x in "$@"; do\\n    n=$((n+1))\\n  done\\n  echo "$n Argumente"\\n}\\nzaehle "$@"\\nif [ $# -gt 1 ]; then\\n  echo viele\\nfi\\n' > s.sh; chmod +x s.sh`);
+  const r = exec(sh, './s.sh a "b c" d');
+  if (r.out === '3 Argumente\nviele\n') pass++; else { fail++; console.log('FAIL multi-line script', JSON.stringify(r.out), r.err); }
+}
+{
+  // Functions survive a save/load round trip.
+  const sh = mk();
+  exec(sh, 'hallo() { echo "hi $1"; }');
+  const sh2 = new Shell(JSON.parse(JSON.stringify(sh.serialize())));
+  let out = ''; sh2.write = (s, k) => { if (k === 'out') out += s; };
+  sh2.run('hallo welt');
+  if (out === 'hi welt\n') pass++; else { fail++; console.log('FAIL function persistence', JSON.stringify(out)); }
+}
+{
+  // Multi-line input typed interactively, line by line.
+  const sh = mk();
+  const a = exec(sh, 'for i in 1 2; do');
+  const b = exec(sh, '  echo $i');
+  const c = exec(sh, 'done');
+  if (a.run.incomplete && b.run.incomplete && c.out === '1\n2\n' && sh.history.at(-1) === 'for i in 1 2; do\n  echo $i\ndone') pass++;
+  else { fail++; console.log('FAIL interactive loop', JSON.stringify([a.run, b.run, c.out, sh.history.at(-1)])); }
+}
+t('grep multi -e', 'seq 10 | grep -e 3 -e 8', '3\n8\n');
+t('grep -ie', 'grep -ie neo -e TANK documents/contacts.csv', 'Neo,the_one,Hamburg\nTank,operator,Muenchen\n');
+
 // --- persistence round trip ---
 {
   const sh = mk();
@@ -372,6 +483,11 @@ t('date tz', 'date +%Z', /^(CET|CEST|UTC|[A-Z]{2,5}|GMT[+-]\d+)\n$/);
     'grep Failed logs/auth.log | wc -l', 'grep Failed logs/auth.log > failed.txt',
     "cut -d' ' -f1 logs/access.log | sort | uniq -c | sort -nr", 'base64 -d downloads/payload.b64',
     'chmod +x tools/scan.sh', 'sudo cat /etc/shadow', 'kill 1337', 'sudo cat /root/flag.txt',
+    'ss -tulpn', 'nmap -sV darknode.local', 'for h in localhost darknode.local example.com; do ping -c 1 $h; done',
+    'if [ -f /var/backups/master.key ]; then echo GEFAEHRDET; else echo SICHER; fi',
+    'grep Failed logs/auth.log | while read monat tag zeit rest; do echo $zeit; done',
+    'portscan() { nmap "$1"; }; portscan darknode.local', 'sha256sum tools/scan.sh > tools.sha256 && sha256sum -c tools.sha256',
+    'echo "*/5 * * * * $HOME/tools/scan.sh" > job.txt && crontab job.txt && crontab -l', 'sudo systemctl stop nginx && ss -tln',
   ];
   let ok = solutions.length === MISSIONS.length;
   solutions.forEach((line, i) => {

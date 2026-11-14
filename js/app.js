@@ -129,7 +129,7 @@ function showEvents(events) {
     print(game.eventText(e));
     if (e.type === 'mission') {
       haptic();
-      banner(e.next ? 'MISSION COMPLETE' : 'SYSTEM PWNED', e.mission.title, e.mission.xp);
+      banner(e.mission.finale || (e.next ? 'MISSION COMPLETE' : 'SYSTEM PWNED'), e.mission.title, e.mission.xp);
     } else if (e.type === 'ach') toast(`🏆 ${e.ach.name} - ${e.ach.desc}`);
     else if (e.type === 'rank') banner('RANG-AUFSTIEG', e.rank.toUpperCase());
   }
@@ -386,7 +386,9 @@ function ctrlC() {
   print(sh.prompt() + input.value + '^C\n', 'cmdline');
   input.value = '';
   hist.idx = -1;
+  sh.pending = null; // also abandons an unfinished multi-line command
   sh.lastCode = 130;
+  renderPrompt();
   scrollDown();
 }
 function insertText(t) {
