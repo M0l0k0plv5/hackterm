@@ -1,6 +1,7 @@
 // Gamification: missions, XP, ranks and achievements. DOM-free.
 import { commands, C } from './commands.js';
-import { ACCESS_CODE } from './world.js';
+import { ACCESS_CODE, MAN } from './world.js';
+import { tipFor } from './tips.js';
 
 const HOME = '/home/hacker';
 const ran = (run, name) => run.cmds.some(c => c.name === name && c.code === 0);
@@ -217,6 +218,27 @@ export const MISSIONS = [
     } },
 ];
 
+// Cheat sheet: the essentials of each chapter, unlocked as the player gets there.
+export const CHEATS = [
+  [['whoami', 'wer bin ich?'], ['pwd', 'wo bin ich?'], ['ls -la', 'Inhalt, auch versteckte Dateien'], ['cat DATEI', 'Datei anzeigen'],
+    ['cd ORDNER  cd ..  cd', 'wechseln, eins hoch, nach Hause']],
+  [['mkdir ORDNER', 'Ordner anlegen'], ['touch DATEI', 'leere Datei anlegen'], ["echo 'text' > DATEI", 'in Datei schreiben'],
+    ['cp QUELLE ZIEL', 'kopieren'], ['mv ALT NEU', 'verschieben / umbenennen'], ['rm DATEI', 'loeschen (ohne Papierkorb!)']],
+  [['head -n 3 DATEI', 'erste Zeilen'], ['tail -n 3 DATEI', 'letzte Zeilen'], ['grep MUSTER DATEI', 'Zeilen suchen'],
+    ['wc -l DATEI', 'Zeilen zaehlen'], ['find / -name "*.key" 2>/dev/null', 'Dateien finden']],
+  [['A | B', 'Ausgabe von A wird Eingabe von B'], ['> DATEI  >> DATEI', 'ueberschreiben / anhaengen'], ['2>/dev/null', 'Fehler verwerfen'],
+    ["cut -d' ' -f1", 'Spalte ausschneiden'], ['sort | uniq -c | sort -nr', 'zaehlen und ranken'], ['base64 -d DATEI', 'dekodieren']],
+  [['ls -l', 'Rechte rwx, Besitzer, Gruppe'], ['chmod +x DATEI', 'ausfuehrbar machen'], ['sudo BEFEHL', 'als root ausfuehren'],
+    ['ps aux | grep NAME', 'Prozess finden'], ['kill PID', 'Prozess beenden']],
+  [['ss -tulpn', 'lauschende Ports'], ['nmap -sV HOST', 'Dienste scannen'], ['for x in a b; do ...; done', 'Schleife'],
+    ['if [ -f DATEI ]; then ...; else ...; fi', 'Bedingung'], ['while read a b rest; do ...; done < DATEI', 'zeilenweise lesen'],
+    ['name() { ...; }', 'eigene Funktion, Argumente $1 $2 $@'], ['sha256sum -c LISTE', 'Pruefsummen pruefen'], ['crontab DATEI', 'Zeitplan setzen']],
+  [['${f##*/}  ${f%.log}', 'vorne / hinten abschneiden'], ['a=(x y z)  ${a[@]}  ${#a[@]}', 'Array, alle Elemente, Anzahl'],
+    ['declare -A m=([k]=v)  ${m[k]}', 'Schluessel-Array'], ['mapfile -t zeilen < DATEI', 'Datei in Array'],
+    ['while getopts "p:" o; do ...; done', 'Optionen auswerten'], ["trap '...' EXIT", 'beim Beenden aufraeumen'],
+    ['set -euo pipefail', 'strenger Modus']],
+];
+
 export const ACHIEVEMENTS = [
   { id: 'pipe', name: 'Pipe Dream', desc: 'Erste Pipe gebaut', test: (g, sh, r) => r.line.includes('|') && r.cmds.length >= 2 },
   { id: 'man', name: 'RTFM', desc: 'Das Handbuch gelesen', test: (g, sh, r) => ran(r, 'man') },
@@ -234,11 +256,12 @@ export const ACHIEVEMENTS = [
   { id: 'strict', name: 'Kugelsicher', desc: 'set -e eingeschaltet', test: (g, sh, r) => r.cmds.some(c => c.name === 'set' && c.code === 0 && c.args.some(a => /^-\w*e/.test(a) || a === 'errexit')) },
 ];
 const ACH_XP = 25;
-const META = new Set(['mission', 'hint', 'missions', 'stats', 'help', 'theme', 'reset']);
+const META = new Set(['mission', 'hint', 'missions', 'stats', 'help', 'theme', 'reset', 'tipps', 'spick', 'cheat']);
+const TIP_REPEAT = 3; // generic tips stop after this many showings
 
 export class Game {
   constructor(saved) {
-    this.s = Object.assign({ xp: 0, idx: 0, ach: [], cmds: 0, hints: 0, dirs: [], used: [] }, saved);
+    this.s = Object.assign({ xp: 0, idx: 0, ach: [], cmds: 0, hints: 0, dirs: [], used: [], tips: true, tipSeen: {} }, saved);
   }
   get mission() { return MISSIONS[this.s.idx] || null; }
   rank(xp = this.s.xp) {
@@ -251,7 +274,8 @@ export class Game {
   // Evaluate a finished command line; returns a list of events for the UI.
   afterRun(sh, run) {
     const events = [];
-    if (!run.cmds.length) return events;
+    const tip = this.tip(sh, run);
+    if (!run.cmds.length) return tip ? [tip] : events;
     const before = this.rank().i;
     this.s.cmds++;
     for (const c of run.cmds) if (c.code !== 127 && !this.s.used.includes(c.name)) this.s.used.push(c.name);
@@ -278,7 +302,23 @@ export class Game {
     }
     const after = this.rank();
     if (after.i > before) events.push({ type: 'rank', rank: after.name });
+    if (tip && !events.some(e => e.type === 'mission' || e.type === 'nudge')) events.unshift(tip);
     return events;
+  }
+
+  // Learning mode: a tip for a typical mistake in this command line, if any.
+  tip(sh, run) {
+    if (!this.s.tips) return null;
+    let t = null;
+    try { t = tipFor(sh, run); } catch { t = null; }
+    if (!t || (t.spoils && this.mission?.hint.includes(t.spoils))) return null;
+    const seen = this.s.tipSeen;
+    if (t.once) {
+      const n = Object.hasOwn(seen, t.id) ? seen[t.id] : 0;
+      if (n >= TIP_REPEAT) return null;
+      seen[t.id] = n + 1;
+    }
+    return { type: 'tip', text: t.text };
   }
 
   // Text renderings (ANSI coloured) shared by commands and UI.
@@ -288,7 +328,7 @@ export class Game {
     const n = String(this.s.idx + 1).padStart(2, '0');
     return `${C.bcyan}┌─ MISSION ${n}/${MISSIONS.length} · Kapitel ${m.ch + 1}: ${CHAPTERS[m.ch]}${C.r}\n` +
       `${C.bcyan}│${C.r} ${C.b}${m.title}${C.r}\n${C.bcyan}│${C.r} ${m.brief}\n` +
-      `${C.bcyan}└─${C.r} ${C.yellow}+${m.xp} XP${C.r} ${C.gray}· Tipp gefaellig? -> hint${C.r}\n`;
+      `${C.bcyan}└─${C.r} ${C.yellow}+${m.xp} XP${C.r} ${C.gray}· Tipp: hint · Spickzettel: spick${C.r}\n`;
   }
   eventText(e) {
     if (e.type === 'mission') {
@@ -299,6 +339,7 @@ export class Game {
     }
     if (e.type === 'ach') return `${C.byellow}🏆 ERFOLG: ${e.ach.name}${C.r} ${C.gray}- ${e.ach.desc}${C.r}  ${C.byellow}+${e.xp} XP${C.r}\n`;
     if (e.type === 'nudge') return `${C.yellow}» ${e.text}${C.r}\n`;
+    if (e.type === 'tip') return `${C.cyan}💡 ${e.text}${C.r}\n`;
     if (e.type === 'rank') return `${C.bred}▲ RANG-AUFSTIEG:${C.r} ${C.b}${e.rank.toUpperCase()}${C.r}\n`;
     return '';
   }
@@ -307,6 +348,42 @@ export class Game {
 // ---- game commands ----
 
 commands.mission = ctx => { ctx.out(ctx.sh.game.missionText()); };
+commands.spick = commands.cheat = ctx => {
+  const g = ctx.sh.game;
+  const reached = g.mission ? g.mission.ch : CHAPTERS.length - 1;
+  const a = ctx.args[0];
+  let list = [...CHEATS.keys()].filter(i => i <= reached);
+  if (a !== undefined) {
+    const n = parseInt(a, 10);
+    if (!(n >= 1 && n <= CHAPTERS.length)) { ctx.err(`usage: spick [1-${CHAPTERS.length}]\n`); return 2; }
+    if (n - 1 > reached) { ctx.out(`${C.gray}Kapitel ${n} ist noch gesperrt - spiel weiter!${C.r}\n`); return; }
+    list = [n - 1];
+  }
+  let out = `${C.bcyan}SPICKZETTEL${C.r}${a === undefined ? ` ${C.gray}(spick N zeigt nur Kapitel N)${C.r}` : ''}\n`;
+  for (const i of list) {
+    out += `\n${C.bcyan}Kapitel ${i + 1}: ${CHAPTERS[i]}${C.r}\n`;
+    const w = Math.max(...CHEATS[i].map(([c]) => c.length));
+    // Narrow screens (iPhone portrait): description on its own line instead of a second column.
+    const narrow = ctx.sh.cols < w + 30;
+    for (const [cmd, what] of CHEATS[i]) {
+      out += narrow ? `  ${C.green}${cmd}${C.r}\n      ${C.gray}${what}${C.r}\n` : `  ${C.green}${cmd.padEnd(w)}${C.r}  ${what}\n`;
+    }
+  }
+  if (a === undefined && reached < CHAPTERS.length - 1) out += `\n${C.gray}${CHAPTERS.length - 1 - reached} weitere Kapitel werden freigeschaltet, sobald du dort ankommst.${C.r}\n`;
+  ctx.out(out);
+};
+MAN.spick = ['spick [KAPITEL]', 'Spickzettel: die wichtigsten Befehle aus jedem Kapitel, das du schon erreicht hast. Auch: cheat.', ['spick', 'spick 3'], 'Spiel'];
+MAN.cheat = MAN.spick;
+
+commands.tipps = ctx => {
+  const g = ctx.sh.game, a = ctx.args[0];
+  if (a === 'an' || a === 'on') g.s.tips = true;
+  else if (a === 'aus' || a === 'off') g.s.tips = false;
+  else if (a === 'reset') g.s.tipSeen = {};
+  else if (a !== undefined) { ctx.err('usage: tipps [an|aus|reset]\n'); return 2; }
+  ctx.out(`Lernmodus (Tipps bei Fehlern): ${g.s.tips ? 'AN' : 'AUS'}\n`);
+};
+MAN.tipps = ['tipps [an|aus|reset]', 'Lernmodus: Bei typischen Fehlern (Tippfehler, Windows-Befehle, fehlende Rechte, falscher Pfad ...) erscheint ein kurzer Tipp. tipps aus schaltet ihn ab, reset zeigt allgemeine Tipps wieder.', ['tipps', 'tipps aus'], 'Spiel'];
 commands.hint = ctx => {
   const g = ctx.sh.game;
   const m = g.mission;

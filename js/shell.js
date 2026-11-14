@@ -957,11 +957,11 @@ export class Shell {
   run(line) {
     this.cmdLog = [];
     this.request = null;
-    let stdout = '';
+    let stdout = '', stderr = '';
     const io = {
       in: null, tty: true,
       out: s => { stdout += s; this.write(s, 'out'); },
-      err: s => this.write(s, 'err'),
+      err: s => { if (stderr.length < 4096) stderr += s; this.write(s, 'err'); },
     };
     if (this.pending === null && /(^|[\s;&|])!!/.test(line) && this.history.length) {
       line = line.replace(/!!/g, this.history[this.history.length - 1]);
@@ -973,13 +973,13 @@ export class Shell {
       if (!(e instanceof SyntaxErr)) throw e;
       if (e instanceof Incomplete && src.trim()) {
         this.pending = src;
-        return { line, code: this.lastCode, cmds: [], stdout: '', incomplete: true };
+        return { line, code: this.lastCode, cmds: [], stdout: '', stderr: '', incomplete: true };
       }
       this.pending = null;
       this.pushHistory(src);
       io.err(`bash: ${e.message}\n`);
       this.lastCode = 2;
-      return { line: src, code: 2, cmds: [], stdout: '' };
+      return { line: src, code: 2, cmds: [], stdout: '', stderr: stderr.replace(/\x1b\[[\d;]*m/g, '') };
     }
     this.pending = null;
     this.pushHistory(src);
@@ -999,7 +999,8 @@ export class Shell {
     this.exiting = false;
     this.lastCode = code;
     this.reportJobs(io, j => j.born < this.runId);
-    return { line: src, code, cmds: this.cmdLog, stdout: stdout.replace(/\x1b\[[\d;]*m/g, '') };
+    const plain = t => t.replace(/\x1b\[[\d;]*m/g, '');
+    return { line: src, code, cmds: this.cmdLog, stdout: plain(stdout), stderr: plain(stderr) };
   }
 
   // "[1]+  Done   cmd" lines for finished background jobs (the shell prints them before a prompt).

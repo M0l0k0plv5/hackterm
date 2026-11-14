@@ -573,6 +573,48 @@ const cases = [
   }
 }
 
+// --- learning mode tips ---
+{
+  const tipCases = [
+    ['grpe Failed logs/auth.log', 'Meintest du grep?'], ['Ls', /Gross- und Kleinschreibung.*ls$/], ['dir', /Windows-Befehl.*ls -l/],
+    ['cd..', /Leerzeichen: cd \.\.$/], ['cd readme.txt', /Datei, kein Ordner.*cat readme.txt/], ['cat logs', /ist ein Ordner/],
+    ['cat redme.txt', 'Meintest du readme.txt?'], ['cat logs/Auth.log', 'Meintest du logs/auth.log?'], ['rm logs', /rm -r logs/],
+    ['x = 5', /x=5$/], ['[-f x]', /Leerzeichen drumherum/], ['touch t.sh; ./t.sh', /chmod \+x t\.sh/], ['echo "abc', /wartet auf den Rest/],
+    ['ls', null], ['grep -c Failed logs/auth.log', null],
+  ];
+  for (const [line, want] of tipCases) {
+    const sh = mk();
+    sh.game = new Game({ idx: MISSIONS.length });
+    const ev = sh.game.afterRun(sh, exec(sh, line).run).filter(e => e.type === 'tip');
+    const got = ev[0]?.text ?? null;
+    const ok = want === null ? got === null : typeof want === 'string' ? got === want : want.test(got ?? '');
+    if (ok) pass++; else { fail++; console.log(`FAIL tip for ${line}: ${JSON.stringify(got)}`); }
+  }
+  // Generic tips stop after a few showings; tipps aus silences everything; sudo tip waits while a mission teaches sudo.
+  const sh = mk();
+  sh.game = new Game({ idx: MISSIONS.length });
+  const count = () => sh.game.afterRun(sh, exec(sh, 'asdfgh').run).filter(e => e.type === 'tip').length;
+  const shown = [1, 2, 3, 4, 5].map(count).reduce((a, b) => a + b);
+  exec(sh, 'tipps aus');
+  const typo = sh.game.afterRun(sh, exec(sh, 'grpe x').run).filter(e => e.type === 'tip').length;
+  const sudoIdx = MISSIONS.findIndex(m => m.hint.startsWith('sudo cat /etc/shadow'));
+  const sh2 = mk();
+  sh2.game = new Game({ idx: sudoIdx });
+  const spoiled = sh2.game.afterRun(sh2, exec(sh2, 'cat /etc/shadow').run).filter(e => e.type === 'tip').length;
+  if (shown === 3 && typo === 0 && spoiled === 0 && sudoIdx >= 0) pass++; else { fail++; console.log('FAIL tip throttling', shown, typo, spoiled, sudoIdx); }
+}
+
+// --- cheat sheet ---
+{
+  const sh = mk();
+  sh.game = new Game({ idx: 15 });
+  const all = exec(sh, 'spick').out, locked = exec(sh, 'spick 7').out, bad = exec(sh, 'spick 9');
+  const ok = all.includes('Kapitel 3: Lesen & Suchen') && !all.includes('Kapitel 4') && /gesperrt/.test(locked) && bad.code === 2;
+  sh.game = new Game({ idx: MISSIONS.length });
+  const done = exec(sh, 'cheat 7').out;
+  if (ok && done.includes('set -euo pipefail')) pass++; else { fail++; console.log('FAIL spick', JSON.stringify(all), locked, done); }
+}
+
 // --- full mission walkthrough using each mission's hint solution ---
 {
   const sh = mk();

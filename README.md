@@ -31,6 +31,10 @@ Pure HTML/CSS/JavaScript web app (PWA), no build step and no dependencies.
   the browser; the hosts, ports and sockets match the story (e.g. the miner's connection to darknode).
 - **Gamification**: 43 missions in 7 chapters with a story (attacker in the logs, crypto miner,
   root flag, then scanning back, automating and locking the attacker out, finally a scripting toolkit), XP, 9 ranks, 14 achievements, `hint`, `stats`, `missions`.
+- **Learning mode**: typical mistakes get a concrete tip right in the terminal: typos (`grpe` -> grep), Windows
+  commands (`dir`, `ipconfig`), `cd` into a file, missing `./` or `chmod +x`, `x = 5`, `[-f x]`, misspelt paths,
+  missing permissions. Generic tips stop after three showings; `tipps aus` turns it off. `spick` shows a cheat sheet
+  of every chapter reached so far.
 - **Hacker look**: CRT scanlines, glow, boot sequence, `cmatrix`, themes (`theme amber|cyan|red|mono`).
 - **iPhone**: special-key bar (TAB, arrows, `| > ~ * $` ..., plus a `#+=` set with `${} [@] { } [ ] ( ) ; # % =` that wraps a selection in pairs), keyboard-aware layout, safe areas,
   "Add to Home Screen" for fullscreen and offline use (service worker).
