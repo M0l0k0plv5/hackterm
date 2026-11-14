@@ -14,9 +14,10 @@ Pure HTML/CSS/JavaScript web app (PWA), no build step and no dependencies.
   continues on a `> ` prompt; runaway loops and recursion are stopped by a step, loop and time budget.
 - **Parameter expansion & arrays**: `${v:-default}` `${v:=x}` `${v:?msg}` `${v:+x}`, `${f%.gz}` `${p##*/}`,
   `${v/old/new}` `${v:1:3}` `${v^^}` `${#v}` `${!ref}`; indexed arrays `a=(x y)`, `a+=(z)`, `"${a[@]}"`,
-  `${#a[@]}`, `${!a[@]}`, `unset a[1]`. Builtins `declare`/`typeset` (`-a -i -r -x -p -f`), `readonly`,
+  `${#a[@]}`, `${!a[@]}`, `unset a[1]`, `a=([3]=x)`; associative arrays `declare -A m=([ssh]=22)`, `${m[$k]}`.
+  Builtins `declare`/`typeset` (`-a -A -i -r -x -p -f`), `readonly`,
   `set -e -u -x -o pipefail` and `set --`, `printf -v`, `mapfile`/`readarray`, `read -a`, `getopts`,
-  `trap` (`EXIT`, `ERR`), `pushd`/`popd`/`dirs`, background jobs `cmd &` with `$!`, `jobs`, `wait`.
+  `trap` (`EXIT`, `ERR`, `INT` on Ctrl-C, `kill -USR1 $$`), `pushd`/`popd`/`dirs`, background jobs `cmd &` with `$!`, `jobs`, `wait`.
 - **Simulated filesystem** with Unix permissions (rwx, owner/group), symlinks, `/etc`, `/var/log`,
   `/root` (root only), `/proc` ... Saved in `localStorage`.
 - **~170 commands** with real options and real error messages: `ls cd cat grep sed awk find sort uniq

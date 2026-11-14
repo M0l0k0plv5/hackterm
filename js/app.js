@@ -388,6 +388,8 @@ function ctrlC() {
   hist.idx = -1;
   sh.pending = null; // also abandons an unfinished multi-line command
   sh.lastCode = 130;
+  // trap '...' INT: Ctrl-C runs the trap instead of only cancelling the line.
+  if (sh.trapSignal('INT')) save();
   renderPrompt();
   scrollDown();
 }

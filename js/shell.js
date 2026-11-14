@@ -491,7 +491,9 @@ export class Shell {
     this.nextPid = s.nextPid || 2100;
     this.flags = dict(s.flags || {});
     this.funcs = dict(s.funcs || {});
-    this.arrays = dict(s.arrays || {}); // indexed arrays: name -> [values] (holes are null)
+    // name -> [values] for indexed arrays (holes are null), name -> {key: value} (null prototype) for declare -A
+    this.arrays = dict(s.arrays || {});
+    for (const k in this.arrays) if (!Array.isArray(this.arrays[k])) this.arrays[k] = dict(this.arrays[k]);
     this.readonly = new Set(s.attrs?.readonly || []);
     this.intVars = new Set(s.attrs?.int || []);
     this.opts = { errexit: false, nounset: false, xtrace: false, pipefail: false };
@@ -572,7 +574,20 @@ export class Shell {
     return v ?? '';
   }
 
+  isAssoc(name) { return Object.hasOwn(this.arrays, name) && !Array.isArray(this.arrays[name]); }
+
+  // Subscript of an associative array: expanded like a word, never arithmetic.
+  assocKey(raw) { return this.expand(raw, false)[0] ?? ''; }
+
+  // Fresh copies of all arrays (for subshells).
+  cloneArrays() {
+    const out = Object.create(null);
+    for (const k in this.arrays) out[k] = Array.isArray(this.arrays[k]) ? [...this.arrays[k]] : Object.assign(Object.create(null), this.arrays[k]);
+    return out;
+  }
+
   arrayItems(name) {
+    if (this.isAssoc(name)) return Object.values(this.arrays[name]);
     if (Object.hasOwn(this.arrays, name)) return this.arrays[name].filter(v => v !== undefined && v !== null);
     const v = this.param(name);
     return v === undefined ? [] : [v];
@@ -591,9 +606,19 @@ export class Shell {
     if (idx === undefined) return name === '@' || name === '*' ? (this.argv.length > 1 ? this.argv.slice(1).join(' ') : undefined) : this.param(name);
     if (!/^[A-Za-z_]\w*$/.test(name)) throw new FatalExpand(`${name}[${idx}]: bad substitution`);
     if (idx === '@' || idx === '*') { const it = this.arrayItems(name); return it.length ? it.join(' ') : undefined; }
+    if (this.isAssoc(name)) { const key = this.assocKey(idx); return Object.hasOwn(this.arrays[name], key) ? this.arrays[name][key] : undefined; }
     const k = this.arrayIndex(name, idx);
     if (Object.hasOwn(this.arrays, name)) return this.arrays[name][k] ?? undefined;
     return k === 0 ? this.param(name) : undefined;
+  }
+
+  // Words of "$@" / "${arr[@]}" / "${!arr[@]}" from a regex match (m[1] = '!', m[2] = name).
+  quotedList(m) {
+    if (!m[2]) return this.argv.slice(1);
+    if (!m[1]) return this.arrayItems(m[2]);
+    if (this.isAssoc(m[2])) return Object.keys(this.arrays[m[2]]);
+    if (Object.hasOwn(this.arrays, m[2])) return this.arrays[m[2]].map((v, k) => (v === undefined || v === null ? null : String(k))).filter(k => k !== null);
+    return this.param(m[2]) === undefined ? [] : ['0'];
   }
 
   listAt(name, idx) {
@@ -614,6 +639,7 @@ export class Shell {
       return String([...(v ?? '')].length);
     }
     if ((m = /^!([A-Za-z_]\w*)\[[@*]\]$/.exec(body))) {
+      if (this.isAssoc(m[1])) return Object.keys(this.arrays[m[1]]).join(' ');
       const arr = Object.hasOwn(this.arrays, m[1]) ? this.arrays[m[1]] : this.arrayItems(m[1]);
       return arr.map((v, k) => (v === undefined || v === null ? null : k)).filter(k => k !== null).join(' ');
     }
@@ -683,7 +709,39 @@ export class Shell {
   assign(name, idx, append, value, preExpanded = false) {
     if (this.readonly.has(name)) throw new ExpandErr(`${name}: readonly variable`);
     if (idx === undefined && !preExpanded && /^\([\s\S]*\)$/.test(value)) {
-      const items = lex(value.slice(1, -1)).filter(t => t.t === 'w').flatMap(t => this.expand(t.v));
+      const words = lex(value.slice(1, -1)).filter(t => t.t === 'w').map(t => t.v);
+      if (this.isAssoc(name)) {
+        // m=([key]=value ...): every element needs a subscript.
+        const map = append ? this.arrays[name] : Object.create(null);
+        for (const w of words) {
+          const mm = /^\[([^\]]*)\]=([\s\S]*)$/.exec(w);
+          if (!mm) throw new ExpandErr(`${name}: ${w}: must use subscript when assigning associative array`);
+          map[this.assocKey(mm[1])] = this.expand(mm[2], false)[0] ?? '';
+          if (Object.keys(map).length > MAX_WORDS) throw new ExpandErr(`${name}: array too large (max ${MAX_WORDS})`);
+        }
+        this.arrays[name] = map;
+        return;
+      }
+      if (words.some(w => /^\[[^\]]*\]=/.test(w))) {
+        // a=([3]=x y): explicit indices; following elements continue after them.
+        const arr = append ? [...(this.arrays[name] || this.arrayItems(name))] : [];
+        let pos = arr.length;
+        for (const w of words) {
+          const mm = /^\[([^\]]*)\]=([\s\S]*)$/.exec(w);
+          if (mm) {
+            pos = parseInt(this.arith(mm[1] || '0'), 10) || 0;
+            if (pos < 0 || pos >= MAX_WORDS) throw new ExpandErr(`${name}[${mm[1]}]: bad array subscript`);
+            arr[pos++] = this.expand(mm[2], false)[0] ?? '';
+          } else {
+            for (const x of this.expand(w)) { if (pos >= MAX_WORDS) throw new ExpandErr(`${name}: array too large (max ${MAX_WORDS})`); arr[pos++] = x; }
+          }
+        }
+        for (let i = 0; i < arr.length; i++) if (arr[i] === undefined) arr[i] = null;
+        this.arrays[name] = arr;
+        delete this.env[name];
+        return;
+      }
+      const items = words.flatMap(w => this.expand(w));
       if (items.length > MAX_WORDS) throw new ExpandErr(`${name}: array too large (max ${MAX_WORDS})`);
       const all = append ? [...(Object.hasOwn(this.arrays, name) ? this.arrays[name] : this.arrayItems(name)), ...items] : items;
       if (all.length > MAX_WORDS) throw new ExpandErr(`${name}: array too large (max ${MAX_WORDS})`);
@@ -695,6 +753,12 @@ export class Shell {
     const int = this.intVars.has(name);
     if (int) v = this.arith(append ? `(${this.paramAt(name, idx) || 0})+(${v || 0})` : v || '0');
     const join = old => (append && !int ? (old ?? '') + v : v);
+    if (this.isAssoc(name)) {
+      const map = this.arrays[name], key = idx === undefined ? '0' : this.assocKey(idx);
+      if (!Object.hasOwn(map, key) && Object.keys(map).length >= MAX_WORDS) throw new ExpandErr(`${name}: array too large (max ${MAX_WORDS})`);
+      map[key] = join(Object.hasOwn(map, key) ? map[key] : undefined);
+      return;
+    }
     if (idx !== undefined) {
       if (!Object.hasOwn(this.arrays, name)) {
         this.arrays[name] = Object.hasOwn(this.env, name) ? [this.env[name]] : [];
@@ -707,6 +771,25 @@ export class Shell {
     }
     if (Object.hasOwn(this.arrays, name)) { this.arrays[name][0] = join(this.arrays[name][0]); return; }
     this.env[name] = join(this.env[name]);
+  }
+
+  // A signal sent to the shell itself (Ctrl-C, kill $$): runs its trap.
+  // Returns false if no trap is set, so the caller applies the default action.
+  trapSignal(sig, io) {
+    const t = this.traps[sig];
+    if (t === undefined) return false;
+    if (t === '' || this.inSignal) return true; // trap '' SIG ignores the signal
+    if (!io) {
+      io = { in: null, tty: true, out: x => this.write(x, 'out'), err: x => this.write(x, 'err') };
+      this.budget = { steps: 0, loops: 0, t0: Date.now() };
+    }
+    const saved = this.lastCode;
+    this.inSignal = true;
+    try { this.runLine(t, this.normIo(io)); } catch (e) {
+      if (e instanceof LimitSig) io.err(`bash: ${e.msg}\n`); else if (!(e instanceof Signal)) throw e;
+    } finally { this.inSignal = false; this.exiting = false; }
+    this.lastCode = saved;
+    return true;
   }
 
   expandError(e, io, prefix = '') {
@@ -790,7 +873,7 @@ export class Shell {
   expand(raw, split = true, keepGlob = false) {
     // "$@" / "${arr[@]}" with no elements expands to no word at all.
     let mm;
-    if (split && (mm = /^"\$(?:@|\{@\}|\{([A-Za-z_]\w*)\[@\]\})"$/.exec(raw)) && !this.listAt(mm[1] ?? '@').length) return [];
+    if (split && (mm = /^"\$(?:@|\{@\}|\{(!?)([A-Za-z_]\w*)\[@\]\})"$/.exec(raw)) && !this.quotedList(mm).length) return [];
     const fields = [];
     let cur = '', has = false;
     const unquoted = txt => {
@@ -813,9 +896,9 @@ export class Shell {
         while (i < raw.length && raw[i] !== '"') {
           const q = raw[i];
           if (q === '\\' && '"\\$`'.includes(raw[i + 1])) { cur += raw[i + 1]; i += 2; }
-          else if (split && q === '$' && (mm = /^\$(?:@|\{@\}|\{([A-Za-z_]\w*)\[@\]\})/.exec(raw.slice(i)))) {
-            // "$@" and "${arr[@]}" keep every element as its own word.
-            this.listAt(mm[1] ?? '@').forEach((a, k) => { if (k > 0) { fields.push(cur); cur = ''; } cur += a; });
+          else if (split && q === '$' && (mm = /^\$(?:@|\{@\}|\{(!?)([A-Za-z_]\w*)\[@\]\})/.exec(raw.slice(i)))) {
+            // "$@", "${arr[@]}" and "${!arr[@]}" keep every element as its own word.
+            this.quotedList(mm).forEach((a, k) => { if (k > 0) { fields.push(cur); cur = ''; } cur += a; });
             i += mm[0].length;
           }
           else if (q === '$') { const [t, n] = this.dollar(raw, i); cur += t; i = n; }
@@ -1071,7 +1154,7 @@ export class Shell {
       case 'subshell': {
         const saved = { cwd: this.cwd, env: this.env, exported: this.exported, funcs: this.funcs, aliases: this.aliases, umask: this.fs.umask, arrays: this.arrays, opts: this.opts, dirStack: this.dirStack };
         this.env = Object.assign(Object.create(null), this.env);
-        this.arrays = Object.assign(Object.create(null), ...Object.keys(this.arrays).map(k => ({ [k]: [...this.arrays[k]] })));
+        this.arrays = this.cloneArrays();
         this.opts = { ...this.opts };
         this.dirStack = [...this.dirStack];
         this.exported = new Set(this.exported);
@@ -1598,11 +1681,15 @@ const funcText = (name, f) => {
 
 // One line of `declare -p` output.
 function describeVar(sh, k) {
-  const isArr = Object.hasOwn(sh.arrays, k);
+  const isArr = Object.hasOwn(sh.arrays, k), assoc = sh.isAssoc(k);
   if (!isArr && !Object.hasOwn(sh.env, k)) return null;
-  let fl = (isArr ? 'a' : '') + (sh.intVars.has(k) ? 'i' : '') + (sh.readonly.has(k) ? 'r' : '') + (sh.exported.has(k) && !isArr ? 'x' : '');
+  let fl = (assoc ? 'A' : isArr ? 'a' : '') + (sh.intVars.has(k) ? 'i' : '') + (sh.readonly.has(k) ? 'r' : '') + (sh.exported.has(k) && !isArr ? 'x' : '');
   fl = fl ? '-' + fl : '--';
   if (!isArr) return `declare ${fl} ${k}=${dq(sh.env[k])}\n`;
+  if (assoc) {
+    const q = key => (/^[\w.-]+$/.test(key) ? key : dq(key));
+    return `declare ${fl} ${k}=(${Object.entries(sh.arrays[k]).map(([key, v]) => `[${q(key)}]=${dq(v)} `).join('')})\n`;
+  }
   const items = sh.arrays[k].map((v, i) => (v === undefined || v === null ? null : `[${i}]=${dq(v)}`)).filter(Boolean);
   return `declare ${fl} ${k}=(${items.join(' ')})\n`;
 }
@@ -1616,8 +1703,7 @@ function declare(ctx, mode) {
     if (a === '--') { i++; break; }
     if (!/^[-+][A-Za-z]+$/.test(a)) break;
     for (const c of a.slice(1)) {
-      if (c === 'A') { ctx.err(`bash: ${mode}: -A: assoziative Arrays kennt HackTerm (noch) nicht - nimm ein normales Array: a=(x y z)\n`); return 2; }
-      if (!'aifFgprx'.includes(c)) { ctx.err(`bash: ${mode}: -${c}: invalid option\nusage: ${mode} [-aifFgprx] [name[=value] ...]\n`); return 2; }
+      if (!'aAifFgprx'.includes(c)) { ctx.err(`bash: ${mode}: -${c}: invalid option\nusage: ${mode} [-aAifFgprx] [name[=value] ...]\n`); return 2; }
       (a[0] === '-' ? on : off).add(c);
     }
   }
@@ -1640,7 +1726,7 @@ function declare(ctx, mode) {
     const keys = names.length ? names : [...new Set([...Object.keys(sh.env), ...Object.keys(sh.arrays)])].sort();
     for (const k of keys) {
       const want = !names.length && (on.size || off.size) && !(on.size === 1 && on.has('p'));
-      if (want && ((on.has('a') && !Object.hasOwn(sh.arrays, k)) || (on.has('r') && !sh.readonly.has(k))
+      if (want && ((on.has('a') && !(Object.hasOwn(sh.arrays, k) && !sh.isAssoc(k))) || (on.has('A') && !sh.isAssoc(k)) || (on.has('r') && !sh.readonly.has(k))
         || (on.has('i') && !sh.intVars.has(k)) || (on.has('x') && !sh.exported.has(k)))) continue;
       const line = describeVar(sh, k);
       if (line) ctx.out(on.has('p') || mode !== 'declare' || want ? line : line.replace(/^declare \S+ /, ''));
@@ -1662,7 +1748,16 @@ function declare(ctx, mode) {
       const fresh = !Object.hasOwn(sh.frames[sh.frames.length - 1], k);
       sh.saveLocal(k);
       // A new local starts empty unless it is assigned right away.
-      if (fresh) { delete sh.env[k]; delete sh.arrays[k]; sh.intVars.delete(k); if (!assigning && !on.has('a')) sh.env[k] = ''; }
+      if (fresh) { delete sh.env[k]; delete sh.arrays[k]; sh.intVars.delete(k); if (!assigning && !on.has('a') && !on.has('A')) sh.env[k] = ''; }
+    }
+    if (on.has('A') && on.has('a')) { ctx.err(`bash: ${mode}: ${k}: cannot use -a and -A together\n`); ctx.fail = 1; continue; }
+    if (on.has('A') && Object.hasOwn(sh.arrays, k) && !sh.isAssoc(k)) { ctx.err(`bash: ${mode}: ${k}: cannot convert indexed to associative array\n`); ctx.fail = 1; continue; }
+    if (on.has('a') && sh.isAssoc(k)) { ctx.err(`bash: ${mode}: ${k}: cannot convert associative to indexed array\n`); ctx.fail = 1; continue; }
+    if (on.has('A') && !Object.hasOwn(sh.arrays, k)) {
+      const map = Object.create(null);
+      if (Object.hasOwn(sh.env, k) && sh.env[k] !== '') map['0'] = sh.env[k];
+      sh.arrays[k] = map;
+      delete sh.env[k];
     }
     if (on.has('a') && !Object.hasOwn(sh.arrays, k)) {
       sh.arrays[k] = Object.hasOwn(sh.env, k) && sh.env[k] !== '' ? [sh.env[k]] : [];
@@ -1703,6 +1798,7 @@ commands.unset = ctx => {
     if (!isVar) continue;
     if (sh.readonly.has(k)) { ctx.err(`bash: unset: ${k}: cannot unset: readonly variable\n`); ctx.fail = 1; continue; }
     if (idx !== undefined && idx !== '@' && idx !== '*') {
+      if (sh.isAssoc(k)) { delete sh.arrays[k][sh.assocKey(idx)]; continue; }
       if (!Object.hasOwn(sh.arrays, k)) { if (sh.arrayIndex(k, idx) === 0) delete sh.env[k]; continue; }
       const n = sh.arrayIndex(k, idx);
       if (n < sh.arrays[k].length) sh.arrays[k][n] = null;
@@ -1867,6 +1963,38 @@ commands.trap = ctx => {
     if (action === '-') delete sh.traps[n]; else sh.traps[n] = action;
   }
 };
+// kill for the shell itself ($$) and for job specs (%1).
+const killCmd = commands.kill;
+commands.kill = ctx => {
+  const sh = ctx.sh, args = ctx.args;
+  if (args[0] === '-l' || args[0] === '-L') { ctx.out(SIGNALS.slice(1).map((n, i) => `${String(i + 1).padStart(2)}) SIG${n}`).join('\n') + '\n'); return; }
+  let sig = 'TERM', i = 0;
+  if (args[0] === '-s' || args[0] === '-n') { sig = sigName(args[1] ?? '') ?? args[1]; i = 2; }
+  else if (/^-\w+$/.test(args[0] ?? '')) { sig = sigName(args[0].slice(1)) ?? args[0].slice(1); i = 1; }
+  const targets = args.slice(i);
+  if (!SIGNALS.includes(sig) || sig === 'EXIT') { ctx.err(`bash: kill: ${sig}: invalid signal specification\n`); return 1; }
+  if (!targets.some(t => t === '2048' || t.startsWith('%'))) return killCmd(ctx);
+  let code = 0;
+  const rest = [];
+  for (const t of targets) {
+    if (t.startsWith('%')) {
+      const j = findJob(sh, t);
+      ctx.err(j ? `bash: kill: (${j.pid}) - No such process\n` : `bash: kill: ${t}: no such job\n`);
+      code = 1;
+    } else if (t === '2048') {
+      if (!sh.trapSignal(sig, ctx.io) && ['KILL', 'HUP', 'QUIT', 'ABRT', 'SEGV'].includes(sig)) {
+        ctx.err('bash: kill: Netter Versuch - die Shell, in der du sitzt, laesst sich in HackTerm nicht abschiessen. ;)\n');
+      }
+    } else rest.push(t);
+  }
+  if (rest.length) {
+    const sub = { ...ctx, args: [...args.slice(0, i), ...rest], fail: 0 };
+    const r = killCmd(sub) ?? (sub.fail ? 1 : 0);
+    if (r) code = r;
+  }
+  return code;
+};
+
 // exit at the prompt still runs the EXIT trap, even if there is no way out of HackTerm.
 const exitCmd = commands.exit;
 commands.exit = commands.logout = ctx => {
@@ -1990,12 +2118,12 @@ commands.type = ctx => {
 };
 
 Object.assign(MAN, {
-  declare: ['declare [-aifFgprx] [NAME[=WERT]...]', 'Setzt Variablen mit Eigenschaften: -a Array, -i Ganzzahl (Zuweisungen werden gerechnet), -r schreibgeschuetzt, -x exportiert. -p zeigt Variablen, -f/-F zeigt Funktionen. In Funktionen sind die Variablen lokal. typeset ist dasselbe.', ['declare -i n=5*4; echo $n', 'declare -a ziele=(web01 db01); declare -p ziele', 'declare -F'], 'Skripte'],
+  declare: ['declare [-aAifFgprx] [NAME[=WERT]...]', 'Setzt Variablen mit Eigenschaften: -a Array, -A assoziatives Array (Schluessel statt Nummern), -i Ganzzahl (Zuweisungen werden gerechnet), -r schreibgeschuetzt, -x exportiert. -p zeigt Variablen, -f/-F zeigt Funktionen. In Funktionen sind die Variablen lokal. typeset ist dasselbe.', ['declare -i n=5*4; echo $n', 'declare -a ziele=(web01 db01); declare -p ziele', 'declare -A port=([ssh]=22 [http]=80); echo ${port[ssh]} ${!port[@]}', 'declare -F'], 'Skripte'],
   readonly: ['readonly NAME[=WERT]...', 'Macht Variablen schreibgeschuetzt - Aendern und unset schlagen fehl.', ['readonly KEY=geheim; KEY=neu'], 'Skripte'],
   set: ['set [-eux] [-o pipefail] [-- ARG...]', 'Shell-Optionen: -e bricht beim ersten Fehler ab, -u meckert ueber leere Variablen, -x zeigt jeden Befehl (+ ...), -o pipefail laesst Pipes scheitern, wenn ein Teil scheitert. set -- a b c setzt $1 $2 $3. +e usw. schaltet aus.', ['set -x; echo $HOME; set +x', 'set -- rot gruen; echo $2', 'set -o pipefail; false | true; echo $?'], 'Skripte'],
   mapfile: ['mapfile [-t] [-n N] [-s N] [ARRAY]', 'Liest alle Zeilen von stdin in ein Array (Standard: MAPFILE). -t entfernt den Zeilenumbruch. readarray ist dasselbe.', ['mapfile -t zeilen < notes.txt; echo ${#zeilen[@]} Zeilen', 'ls | readarray -t dateien'], 'Skripte'],
   getopts: ['getopts OPTSTRING NAME [ARG...]', 'Wertet Optionen wie -v -f datei aus, meist in einer while-Schleife. Ein : nach dem Buchstaben heisst "braucht ein Argument" ($OPTARG).', ['f() { while getopts "vf:" o; do echo "$o $OPTARG"; done; }; f -v -f log'], 'Skripte'],
-  trap: ['trap BEFEHL SIGNAL...', 'Fuehrt BEFEHL aus, wenn ein Signal kommt. EXIT laeuft am Ende eines Skripts, ERR nach jedem fehlgeschlagenen Befehl. trap - SIG entfernt, trap -p zeigt, trap -l listet Signale.', ["trap 'echo Aufraeumen' EXIT", "trap 'echo Fehler: $?' ERR; false"], 'Skripte'],
+  trap: ['trap BEFEHL SIGNAL...', 'Fuehrt BEFEHL aus, wenn ein Signal kommt. EXIT laeuft am Ende eines Skripts, ERR nach jedem fehlgeschlagenen Befehl, INT bei Ctrl-C (^C), TERM/USR1/... bei kill -SIG $$. trap \'\' SIG ignoriert, trap - SIG entfernt, trap -p zeigt, trap -l listet Signale.', ["trap 'echo Aufraeumen' EXIT", "trap 'echo Fehler: $?' ERR; false", "trap 'echo Nix da!' INT   (dann ^C druecken)", "trap 'echo Signal!' USR1; kill -USR1 $$"], 'Skripte'],
   pushd: ['pushd [VERZ]   popd   dirs [-v]', 'Verzeichnis-Stapel: pushd wechselt und merkt sich das alte Verzeichnis, popd springt zurueck, dirs zeigt den Stapel.', ['pushd /var/log; pushd /etc; dirs -v; popd; popd'], 'Skripte'],
   jobs: ['BEFEHL &   jobs   wait [PID]', 'Startet einen Befehl im Hintergrund ($! ist seine PID). In HackTerm sind Hintergrund-Jobs sofort fertig; jobs zeigt sie, wait liefert ihren Exit-Code.', ['sleep 1 & echo PID $!; wait $!', 'false & wait $!; echo $?'], 'Skripte'],
   unset: ['unset [-fv] NAME...', 'Loescht Variablen, Array-Elemente (unset arr[1]) oder Funktionen (-f).', ['x=1; unset x; echo "[$x]"', 'a=(1 2 3); unset a[1]; echo ${a[@]}'], 'Shell'],

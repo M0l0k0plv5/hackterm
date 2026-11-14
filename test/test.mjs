@@ -476,7 +476,14 @@ t('array in subshell', 'a=(1 2); (a+=(3); echo ${#a[@]}); echo ${#a[@]}', '3\n2\
 t('declare -i', 'declare -i n=5*4; n+=1; echo $n', '21\n');
 t('declare -p array', 'declare -a l=(a b); declare -p l', 'declare -a l=([0]="a" [1]="b")\n');
 t('declare -F', 'f(){ :;}; declare -F', 'declare -f f\n');
-t('declare -A refused', 'declare -A m', /assoziative Arrays/, { err: true, code: 2 });
+t('assoc basics', 'declare -A port=([ssh]=22 [http]=80); port[dns]=53; echo ${port[ssh]} ${#port[@]}; for k in "${!port[@]}"; do echo "$k=${port[$k]}"; done', '22 3\nssh=22\nhttp=80\ndns=53\n');
+t('assoc quoted keys', 'declare -A m; k="a b"; m[$k]=1; m["x y"]+=2; m["x y"]+=3; echo "${m[a b]}" "${m[x y]}"; unset "m[a b]"; echo ${#m[@]}', '1 23\n1\n');
+t('assoc declare -p', 'declare -A m=([a]=1 ["b c"]=2); declare -p m', 'declare -A m=([a]="1" ["b c"]="2" )\n');
+t('assoc needs subscript', 'declare -A m=(x y)', /must use subscript/, { err: true });
+t('assoc vs indexed', 'a=(1); declare -A a', /cannot convert indexed to associative/, { err: true });
+t('assoc in subshell', 'declare -A m=([k]=1); (m[k]=2; echo ${m[k]}); echo ${m[k]}', '2\n1\n');
+t('assoc local', 'f() { local -A t=([q]=1); echo ${t[q]}; }; f; echo "[${t[q]-}]"', '1\n[]\n');
+t('indexed with subscripts', 'a=([2]=c x [0]=a); echo ${a[@]} ${!a[@]}', 'a c x 0 2 3\n');
 t('readonly', 'readonly K=1; K=2; unset K; echo $K', '1\n');
 t('readonly msg', 'readonly K=1; K=2', 'bash: K: readonly variable\n', { err: true });
 t('local array', 'f() { local -a t=(1 2); echo ${#t[@]}; }; f; echo "[${t[@]}]"', '2\n[]\n');
@@ -496,6 +503,18 @@ t('read -a', 'IFS=: read -a parts <<< "a:b:c"; echo ${parts[2]} ${#parts[@]}', '
 t('getopts', 'f() { while getopts "vf:" o; do echo "$o ${OPTARG-}"; done; shift $((OPTIND-1)); echo "rest $@"; }; f -v -f log x y', 'v \nf log\nrest x y\n');
 t('getopts bad option', 'f() { getopts "a" o; echo $o; }; f -z', '?\n');
 t('ERR trap', "f() { trap 'echo ERR $?' ERR; false; echo nach; }; f", 'ERR 1\nnach\n');
+t('kill $$ runs trap', "trap 'echo got USR1' USR1; kill -USR1 $$; kill -s USR1 $$; trap '' TERM; kill $$; echo alive", 'got USR1\ngot USR1\nalive\n');
+t('kill $$ KILL', 'kill -9 $$', /nicht abschiessen/, { err: true });
+t('kill job spec', 'true & kill %1; kill %7', /^\[1\] \d+\nbash: kill: \(\d+\) - No such process\nbash: kill: %7: no such job\n$/, { err: true });
+t('kill bad signal', 'kill -FOO 1337', 'bash: kill: FOO: invalid signal specification\n', { err: true });
+t('kill normal pid still works', 'kill -9 1337; ps aux | grep -c xmrig', '0\n');
+{
+  const sh = mk();
+  exec(sh, "trap 'echo abgefangen' INT");
+  sh.buf.out = '';
+  const hit = sh.trapSignal('INT');
+  if (hit && sh.buf.out === 'abgefangen\n' && !sh.trapSignal('TERM')) pass++; else { fail++; console.log('FAIL trapSignal INT', hit, JSON.stringify(sh.buf.out)); }
+}
 t('trap -p', "trap 'echo x' INT; trap -p INT; trap - INT; trap -p", "trap -- 'echo x' INT\n");
 t('EXIT trap in script', `printf '%s\\n' "trap 'echo bye \\$?' EXIT" 'set -e' 'echo start' 'false' 'echo never' > /tmp/s.sh; bash /tmp/s.sh; echo rc=$?; set -o | grep errexit`, 'start\nbye 1\nrc=1\nerrexit        \toff\n');
 t('pushd/popd', 'cd /; pushd /etc >/dev/null; pushd /tmp >/dev/null; dirs; popd >/dev/null; pwd', '/tmp /etc /\n/etc\n');
@@ -507,11 +526,11 @@ t('unset -f', 'f() { :; }; unset -f f; type f', 'bash: type: f: not found\n', { 
 t('declare -f source', 'f() { echo $1; }; declare -f f', 'f () { echo $1; }\n');
 {
   const sh = mk();
-  exec(sh, 'arr=(a "b c"); readonly RO=1');
+  exec(sh, 'arr=(a "b c"); readonly RO=1; declare -A cfg=([__proto__]=x [host]=box)');
   const back = new Shell(JSON.parse(JSON.stringify(sh.serialize())));
   back.game = new Game(); back.buf = { out: '', err: '' };
   back.write = (x, k) => { if (k === 'out') back.buf.out += x; };
-  t('arrays persist', 'echo ${#arr[@]} ${arr[1]}; RO=2; echo $RO', '2 b c\n1\n', { sh: back });
+  t('arrays persist', 'echo ${#arr[@]} ${arr[1]}; RO=2; echo $RO ${cfg[host]} ${cfg[__proto__]} ${#cfg[@]}', '2 b c\n1 box x 2\n', { sh: back });
 }
 {
   const sh = mk();
