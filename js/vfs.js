@@ -41,12 +41,19 @@ export const parentPath = p => { const i = p.lastIndexOf('/'); return i <= 0 ? '
 export const baseName = p => p.slice(p.lastIndexOf('/') + 1);
 
 const enc = new TextEncoder();
+
+// Directory children are keyed by user-chosen names, so names like "__proto__" or
+// "constructor" must never hit Object.prototype: read only own keys, define on write.
+export const child = (dir, name) => (Object.hasOwn(dir.c, name) ? dir.c[name] : undefined);
+export const setChild = (dir, name, node) =>
+  Object.defineProperty(dir.c, name, { value: node, writable: true, enumerable: true, configurable: true });
 const cmp = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 
 export class VFS {
   constructor(root) {
     this.root = root;
     this.user = 'hacker';
+    this.umask = 0o022;
   }
 
   // Permission check for the current user: what is 'r', 'w' or 'x'.
@@ -65,15 +72,15 @@ export class VFS {
     for (let i = 0; i < parts.length; i++) {
       if (node.t !== 'd') fail('ENOTDIR');
       if (!this.can(node, 'x')) fail('EACCES');
-      const child = node.c[parts[i]];
-      if (!child) fail('ENOENT');
+      const next = child(node, parts[i]);
+      if (!next) fail('ENOENT');
       const last = i === parts.length - 1;
-      if (child.t === 'l' && (!last || follow)) {
-        const target = normalize(child.to, cur || '/');
+      if (next.t === 'l' && (!last || follow)) {
+        const target = normalize(next.to, cur || '/');
         const rest = parts.slice(i + 1).join('/');
         return this.lookup(rest ? normalize(target + '/' + rest) : target, follow, depth + 1);
       }
-      node = child;
+      node = next;
       cur += '/' + parts[i];
     }
     return node;
@@ -106,7 +113,7 @@ export class VFS {
   writeFile(path, data, append = false) {
     if (path === '/dev/null') return;
     const { dir, name } = this.parent(path);
-    let n = dir.c[name];
+    let n = child(dir, name);
     if (n && n.t === 'l') n = this.lookup(path);
     if (n) {
       if (n.t === 'd') fail('EISDIR');
@@ -115,16 +122,16 @@ export class VFS {
       n.mt = now();
     } else {
       if (!this.can(dir, 'w')) fail('EACCES');
-      dir.c[name] = this.node('f', { d: data }, 0o644);
+      setChild(dir, name, this.node('f', { d: data }, 0o666 & ~this.umask));
       dir.mt = now();
     }
   }
 
   mkdir(path) {
     const { dir, name } = this.parent(path);
-    if (dir.c[name]) fail('EEXIST');
+    if (child(dir, name)) fail('EEXIST');
     if (!this.can(dir, 'w')) fail('EACCES');
-    dir.c[name] = this.node('d', { c: {} }, 0o755);
+    setChild(dir, name, this.node('d', { c: {} }, 0o777 & ~this.umask));
     dir.mt = now();
   }
 
@@ -138,7 +145,7 @@ export class VFS {
   // Unlink any node; callers decide about emptiness / recursion.
   remove(path) {
     const { dir, name } = this.parent(path);
-    if (!dir.c[name]) fail('ENOENT');
+    if (!child(dir, name)) fail('ENOENT');
     if (!this.can(dir, 'w')) fail('EACCES');
     delete dir.c[name];
     dir.mt = now();
@@ -147,7 +154,7 @@ export class VFS {
   put(path, node) {
     const { dir, name } = this.parent(path);
     if (!this.can(dir, 'w')) fail('EACCES');
-    dir.c[name] = node;
+    setChild(dir, name, node);
     dir.mt = now();
   }
 

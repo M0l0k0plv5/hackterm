@@ -1,6 +1,8 @@
 // Engine tests, run with: node test/test.mjs
 import { Shell } from '../js/shell.js';
 import { Game, MISSIONS } from '../js/game.js';
+import { HASHES } from '../js/more.js';
+import { createHash } from 'node:crypto';
 
 let pass = 0, fail = 0;
 function mk() {
@@ -211,7 +213,7 @@ t('usage error', 'ls -Z', "ls: invalid option -- 'Z'\nTry 'man ls' for more info
 {
   const sh = mk();
   const eq = (name, got, exp) => { if (JSON.stringify(got) === JSON.stringify(exp)) pass++; else { fail++; console.log(`FAIL ${name}: ${JSON.stringify(got)} != ${JSON.stringify(exp)}`); } };
-  eq('complete cmd', sh.complete('who').line, 'whoami ');
+  eq('complete cmd', sh.complete('whoa').line, 'whoami ');
   eq('complete path', sh.complete('cat rea').line, 'cat readme.txt ');
   eq('complete dir', sh.complete('cd doc').line, 'cd documents/');
   eq('complete multi', sh.complete('cat do'), { line: 'cat do', options: ['documents/', 'downloads/'] });
@@ -230,6 +232,120 @@ t('usage error', 'ls -Z', "ls: invalid option -- 'Z'\nTry 'man ls' for more info
   if (sh.game.s.idx === 4 && ev1.some(e => e.type === 'nudge') && !ev1.some(e => e.type === 'mission') && ev2.some(e => e.type === 'mission')) pass++;
   else { fail++; console.log('FAIL mission 4 hidden files', JSON.stringify(ev1), JSON.stringify(ev2)); }
 }
+
+// --- names that collide with Object.prototype must behave like normal names ---
+t('proto file', 'touch __proto__ constructor; echo hi > toString; ls; cat toString', /^__proto__\s[\s\S]*constructor[\s\S]*toString\nhi\n$/);
+t('proto missing', 'cat constructor', 'cat: constructor: No such file or directory\n', { err: true, code: 1 });
+t('proto mkdir', 'mkdir hasOwnProperty && ls -d hasOwnProperty', 'hasOwnProperty\n');
+t('proto var', 'echo "[$constructor][$__proto__]"; constructor=v; echo $constructor', '[][]\nv\n');
+t('proto alias', 'alias __proto__="echo aliased"; __proto__', 'aliased\n');
+{
+  const sh = mk();
+  exec(sh, 'mkdir -p a/__proto__; echo x > a/__proto__/f; constructor=1');
+  const sh2 = new Shell(JSON.parse(JSON.stringify(sh.serialize())));
+  let out = ''; sh2.write = (s, k) => { if (k === 'out') out += s; };
+  sh2.run('cat a/__proto__/f; echo $constructor');
+  if (out === 'x\n1\n' && Object.keys(Object.prototype).length === 0) pass++; else { fail++; console.log('FAIL proto persistence', JSON.stringify(out)); }
+}
+
+t('proto host ping', 'ping -c 1 constructor', 'ping: constructor: Name or service not known\n', { err: true, code: 2 });
+t('proto host trace', 'traceroute __proto__', /Name or service not known/, { err: true, code: 2 });
+t('proto man', 'man constructor', /No manual entry for constructor/, { err: true, code: 16 });
+t('proto unit', 'systemctl status toString', 'Unit toString.service could not be found.\n', { err: true, code: 4 });
+
+// --- tar archives are user-editable files and must be validated ---
+t('tar corrupt', `echo 'SIMTAR1\n{"p":1}' > bad.tar; tar -xf bad.tar`, /Archive is corrupt/, { err: true, code: 2 });
+t('tar no chmod foreign', `echo 'SIMTAR1\n[{"p":"f","t":"f","d":"x","m":4095}]' > a.tar; tar -xf a.tar; ls -l f`, /^-rwxrwxrwx /);
+
+// --- additional commands (js/more.js) ---
+t('yes', 'yes ok | head -n 2', 'ok\nok\n');
+t('paste -sd', 'seq 4 | paste -sd+', '1+2+3+4\n');
+t('paste files', 'paste downloads/words.txt downloads/numbers.txt | head -n 2', 'banana\t42\napple\t7\n');
+t('comm', 'printf "a\\nb\\nc\\n" > x; printf "b\\nc\\nd\\n" > y; comm x y', 'a\n\t\tb\n\t\tc\n\td\n');
+t('comm -12', 'printf "a\\nb\\n" > x; printf "b\\nc\\n" > y; comm -12 x y', 'b\n');
+t('column -t', 'column -t -s, documents/contacts.csv | head -n 2', 'name      alias     city\nTrinity   tr1n      Berlin\n');
+t('fold -s', 'echo "eins zwei drei" | fold -w 8 -s', 'eins \nzwei \ndrei\n');
+t('shuf -n', 'shuf -i 1-3 | sort', '1\n2\n3\n');
+t('shuf -e', 'shuf -e a b c -n 2 | wc -l', '2\n');
+t('expr mul', 'expr 6 \\* 7', '42\n');
+t('expr prec', 'expr 2 + 3 \\* 4', '14\n');
+t('expr length', 'expr length hallo', '5\n');
+t('expr match', 'expr abc123 : "[a-z]*"', '3\n');
+t('expr group', 'expr report.txt : "\\(.*\\)\\.txt"', 'report\n');
+t('expr false', 'expr 3 = 4', '0\n', { code: 1 });
+t('expr div0', 'expr 1 / 0', 'expr: division by zero\n', { err: true, code: 2 });
+t('expr nonint', 'expr a + 1', 'expr: non-integer argument\n', { err: true, code: 2 });
+t('factor', 'factor 1337 360', '1337: 7 191\n360: 2 2 2 3 3 5\n');
+{
+  // Hash implementations against node:crypto, including multi-block and UTF-8 input.
+  const inputs = ['', 'abc', 'a'.repeat(55), 'a'.repeat(56), 'a'.repeat(64), 'x'.repeat(1000), 'Grüße, Operator ✓\n'];
+  const algo = { md5sum: 'md5', sha1sum: 'sha1', sha256sum: 'sha256' };
+  let ok = true;
+  for (const [cmd, fn] of Object.entries(HASHES)) for (const s of inputs) {
+    const want = createHash(algo[cmd]).update(s, 'utf8').digest('hex');
+    const got = fn(new TextEncoder().encode(s));
+    if (got !== want) { ok = false; console.log(`FAIL ${cmd} ${JSON.stringify(s.slice(0, 20))}: ${got} != ${want}`); }
+  }
+  if (ok) pass++; else fail++;
+}
+t('sha256sum', 'echo -n abc | sha256sum', 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  -\n');
+t('sha256sum -c', 'sha256sum notes.txt > s; sha256sum -c s; echo x >> notes.txt; sha256sum -c s', 'notes.txt: OK\nnotes.txt: FAILED\n', { code: 1 });
+t('xxd', 'echo "Hello world" | xxd', '00000000: 4865 6c6c 6f20 776f 726c 640a            Hello world.\n');
+t('xxd -p -r', 'echo hi | xxd -p | xxd -r -p', 'hi\n');
+t('xxd -r', 'echo "Hello world" | xxd | xxd -r', 'Hello world\n');
+t('hexdump -C', 'echo "Hello world" | hexdump -C', '00000000  48 65 6c 6c 6f 20 77 6f  72 6c 64 0a              |Hello world.|\n0000000c\n');
+t('gzip roundtrip', 'gzip notes.txt && ls notes* && gunzip notes.txt.gz && head -n 1 notes.txt', 'notes.txt.gz\nTODO\n');
+t('gzip -k zcat', 'gzip -k readme.txt; ls readme*; zcat readme.txt.gz | head -n 1', /^readme\.txt\s+readme\.txt\.gz\n=== OPERATION NIGHTFALL ===\n$/);
+t('gzip pipe', 'echo hi | gzip | gunzip', 'hi\n');
+t('gzip tty', 'gzip', /not written to a terminal/, { err: true, code: 1 });
+t('file gz', 'gzip -k notes.txt; file notes.txt.gz', 'notes.txt.gz: gzip compressed data, was "notes.txt", from Unix\n');
+t('chgrp', 'chgrp sudo notes.txt; stat -c %G notes.txt', 'sudo\n');
+t('chgrp denied', 'chgrp root notes.txt', "chgrp: changing group of 'notes.txt': Operation not permitted\n", { err: true, code: 1 });
+t('mktemp', 'f=$(mktemp); stat -c "%a %U" $f', '600 hacker\n');
+t('mktemp -d', 'd=$(mktemp -d); stat -c %F $d', 'directory\n');
+t('stat -c', 'stat -c "%n %a %A %U:%G" /etc/shadow', '/etc/shadow 600 -rw------- root:root\n');
+t('umask', 'umask; umask 077; touch p; mkdir q; stat -c %a p q; umask -S', '0022\n600\n700\nu=rwx,g=,o=\n');
+t('time', 'time echo hi', 'hi\n');
+t('time stderr', 'time true', /^\nreal\t0m\d\.\d{3}s\nuser\t.*\nsys\t0m0\.000s\n$/, { err: true });
+t('dmesg user', 'dmesg', 'dmesg: read kernel buffer failed: Operation not permitted\n', { err: true, code: 1 });
+t('dmesg root', 'sudo dmesg | grep -c CPU', '2\n');
+t('systemctl status', 'systemctl is-active ssh', 'active\n');
+t('systemctl denied', 'systemctl stop ssh', /Interactive authentication required/, { err: true, code: 1 });
+t('systemctl stop', 'sudo systemctl stop nginx; systemctl is-active nginx; ss -tln | grep -c :80', 'inactive\n0\n');
+t('systemctl start', 'sudo systemctl stop nginx; sudo systemctl start nginx; systemctl is-active nginx', 'active\n');
+t('journalctl user', 'journalctl', '-- No entries --\n', { code: 1 });
+t('journalctl -u', 'sudo journalctl -u ssh | grep -c Failed', '7\n');
+t('crontab none', 'crontab -l', 'no crontab for hacker\n', { err: true, code: 1 });
+t('crontab install', 'echo "*/5 * * * * ~/tools/scan.sh" > job; crontab job; crontab -l', '*/5 * * * * ~/tools/scan.sh\n');
+t('crontab bad', 'echo "kaputt" > job; crontab job', /errors in crontab file/, { err: true, code: 1 });
+t('crontab -r', 'echo "@daily echo hi" > job; crontab job; crontab -r; crontab -l', 'no crontab for hacker\n', { err: true, code: 1 });
+t('pstree', 'pstree', 'init─┬─cron\n     ├─nginx\n     ├─sshd───bash───pstree\n     └─xmrig\n');
+t('pstree kill', 'kill 1337; pstree | grep -c xmrig', '0\n');
+t('nmap', 'nmap localhost | grep open', '22/tcp   open   ssh\n80/tcp   open   http\n');
+t('nmap -sV', 'nmap -sV -p 3333 darknode.local | grep 3333', '3333/tcp open   dec-notes  XMRig stratum pool\n');
+t('nmap closed', 'nmap -p 23 localhost | grep 23/', '23/tcp   closed telnet\n');
+t('nmap -sn', 'nmap -sn 192.168.1.0/24 | grep -c "Host is up"', '3\n');
+t('nmap bad port', 'nmap -p abc localhost', /port specifications are illegal/, { err: true, code: 1 });
+t('nc -z ok', 'nc -zv localhost 22', 'Connection to localhost (127.0.0.1) 22 port [tcp/ssh] succeeded!\n', { err: true });
+t('nc -z refused', 'nc -zv localhost 81', /Connection refused/, { err: true, code: 1 });
+t('nc banner', 'nc localhost 22', 'SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13\r\n');
+t('nc http', 'printf "GET / HTTP/1.0\\r\\n\\r\\n" | nc example.com 80 | head -n 1', 'HTTP/1.1 200 OK\r\n');
+t('host', 'host example.com; host 10.0.0.66', 'example.com has address 93.184.215.14\n66.0.0.10.in-addr.arpa domain name pointer darknode.local.\n');
+t('host nx', 'host nope.invalid', 'Host nope.invalid not found: 3(NXDOMAIN)\n', { code: 1 });
+t('dig +short', 'dig +short kernel.org; dig -x 8.8.8.8 +short', '139.178.84.217\ndns.google.\n');
+t('dig full', 'dig example.com | grep -A1 "ANSWER SECTION"', ';; ANSWER SECTION:\nexample.com.\t\t300\tIN\tA\t93.184.215.14\n');
+t('nslookup', 'nslookup google.com | tail -n 3', 'Name:\tgoogle.com\nAddress: 142.250.185.78\n\n');
+t('traceroute', 'traceroute -n darknode.local | wc -l', '3\n');
+t('netstat user', 'netstat -tnp | grep 3333', /1337\/xmrig\n$/);
+t('netstat hidden', 'netstat -tlnp | grep :22', /LISTEN\s+-\n$/);
+t('netstat root', 'sudo netstat -tlnp | grep :22', /811\/sshd\n$/);
+t('netstat kill', 'kill 1337; netstat -tn | grep -c 3333', '0\n', { code: 1 });
+t('lsof -i', 'lsof -i | tail -n 1', /^xmrig\s+1337\s+hacker\s+12u\s+IPv4.*darknode\.local:dec-notes \(ESTABLISHED\)$/m);
+t('grep -A', 'grep -A1 Neo documents/contacts.csv', 'Neo,the_one,Hamburg\nMorpheus,morph,Koeln\n');
+t('grep -C sep', 'seq 10 | grep -C1 -E "3|8"', '2\n3\n4\n--\n7\n8\n9\n');
+t('grep -B -n', 'grep -n -B1 date downloads/words.txt', '6-apple\n7:date\n');
+t('grep -C merge', 'seq 5 | grep -C1 -E "2|4"', '1\n2\n3\n4\n5\n');
+t('date tz', 'date +%Z', /^(CET|CEST|UTC|[A-Z]{2,5}|GMT[+-]\d+)\n$/);
 
 // --- persistence round trip ---
 {

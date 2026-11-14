@@ -1,6 +1,7 @@
 // Shell interpreter: lexer, parser, expansion and execution on top of the VFS.
 import { VFS, normalize, parentPath, baseName } from './vfs.js';
 import { commands, Usage, BUILTINS } from './commands.js';
+import './more.js'; // registers the additional commands
 import { FsError } from './vfs.js';
 import { buildWorld, initialProcs } from './world.js';
 import { calc } from './awk.js';
@@ -164,18 +165,21 @@ export class Shell {
   constructor(saved) {
     const s = saved || {};
     this.fs = new VFS(s.root || buildWorld());
+    if (Number.isInteger(s.umask)) this.fs.umask = s.umask & 0o777;
     this.cwd = s.cwd || '/home/hacker';
-    this.env = s.env || {
+    // Null-prototype maps: variable and alias names come from the user.
+    const dict = o => Object.assign(Object.create(null), o);
+    this.env = dict(s.env || {
       USER: 'hacker', HOME: '/home/hacker', SHELL: '/bin/bash', HOSTNAME: 'box',
       PATH: '/usr/local/bin:/usr/bin:/bin', LANG: 'en_US.UTF-8', TERM: 'xterm-256color',
       EDITOR: 'nano', PWD: '/home/hacker',
-    };
+    });
     this.exported = new Set(s.exported || Object.keys(this.env));
-    this.aliases = s.aliases || { ll: 'ls -la', la: 'ls -A' };
+    this.aliases = dict(s.aliases || { ll: 'ls -la', la: 'ls -A' });
     this.history = s.history || [];
     this.procs = s.procs || initialProcs();
     this.nextPid = s.nextPid || 2100;
-    this.flags = s.flags || {};
+    this.flags = dict(s.flags || {});
     this.lastCode = 0;
     this.argv = ['bash'];
     this.cols = 80;
@@ -201,7 +205,7 @@ export class Shell {
     return {
       root: this.fs.root, cwd: this.cwd, env: this.env, exported: [...this.exported],
       aliases: this.aliases, history: this.history.slice(-500), procs: this.procs,
-      nextPid: this.nextPid, flags: this.flags,
+      nextPid: this.nextPid, flags: this.flags, umask: this.fs.umask,
     };
   }
 
@@ -426,7 +430,7 @@ export class Shell {
       return 1;
     }
 
-    const saved = {};
+    const saved = Object.create(null);
     for (const a of assigns) {
       const eq = a.indexOf('=');
       const k = a.slice(0, eq);

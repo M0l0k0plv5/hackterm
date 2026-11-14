@@ -247,3 +247,7 @@ export const MAN = {
   neofetch: ['neofetch', 'Systeminfo mit Logo.', [], 'Spiel'],
   cmatrix: ['cmatrix', 'Folge dem weissen Kaninchen.', [], 'Spiel'],
 };
+
+// Lookup tables are indexed with user input (host names, command names), so they must
+// not inherit keys like "constructor" or "__proto__" from Object.prototype.
+for (const table of [HOSTS, SITES, MAN]) Object.setPrototypeOf(table, null);

@@ -19,7 +19,7 @@ export const C = {
 
 // ---------- helpers ----------
 
-function opts(ctx, bools, valued = '', long = {}, stopAtOperand = false) {
+export function opts(ctx, bools, valued = '', long = {}, stopAtOperand = false) {
   const o = {}, rest = [];
   const a = ctx.args;
   for (let i = 0; i < a.length; i++) {
@@ -54,15 +54,22 @@ function opts(ctx, bools, valued = '', long = {}, stopAtOperand = false) {
   return { o, rest };
 }
 
-const lines = text => { const l = text.split('\n'); if (l[l.length - 1] === '') l.pop(); return l; };
-const pad = (n, w = 2, c = '0') => String(n).padStart(w, c);
-const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-const DAY = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+export const lines = text => { const l = text.split('\n'); if (l[l.length - 1] === '') l.pop(); return l; };
+export const pad = (n, w = 2, c = '0') => String(n).padStart(w, c);
+export const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+export const DAY = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 const cmpS = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
-const UID = { root: 0, daemon: 1, 'www-data': 33, hacker: 1000 };
+// Short time zone name (CET/CEST in Germany). Initials of the long name are wrong:
+// "Central European Standard Time" would become "CEST".
+export function tzAbbr(d = new Date()) {
+  let s = 'UTC';
+  try { s = new Intl.DateTimeFormat('en-US', { timeZoneName: 'short' }).formatToParts(d).find(p => p.type === 'timeZoneName')?.value ?? 'UTC'; } catch { /* no Intl */ }
+  return { 'GMT+1': 'CET', 'GMT+2': 'CEST', GMT: 'UTC', UTC: 'UTC' }[s] ?? s;
+}
+export const UID = { root: 0, daemon: 1, 'www-data': 33, hacker: 1000 };
 
 // Read operands (or stdin) as text; reports errors in the usual "cmd: file: msg" form.
-function readAll(ctx, files) {
+export function readAll(ctx, files) {
   const res = [];
   if (!files.length) files = ['-'];
   for (const f of files) {
@@ -75,7 +82,7 @@ function readAll(ctx, files) {
   return res;
 }
 
-function human(n) {
+export function human(n) {
   if (n < 1024) return String(n);
   for (const u of ['K', 'M', 'G', 'T']) {
     n /= 1024;
@@ -83,7 +90,7 @@ function human(n) {
   }
 }
 
-function modeStr(n) {
+export function modeStr(n) {
   const t = n.t === 'd' ? 'd' : n.t === 'l' ? 'l' : '-';
   let s = '';
   for (let i = 8; i >= 0; i--) s += (n.m >> i) & 1 ? 'rwx'[(8 - i) % 3] : '-';
@@ -119,7 +126,7 @@ function bre(s) {
   return out;
 }
 
-function toRegex(pat, { ext = false, fixed = false, icase = false, word = false, global = true } = {}) {
+export function toRegex(pat, { ext = false, fixed = false, icase = false, word = false, global = true } = {}) {
   let src;
   if (fixed) src = pat.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   else {
@@ -145,7 +152,7 @@ function globRe(pat, icase) {
   return new RegExp(re + '$', icase ? 'i' : '');
 }
 
-const joinPath = (a, b) => (a.endsWith('/') ? a + b : a + '/' + b);
+export const joinPath = (a, b) => (a.endsWith('/') ? a + b : a + '/' + b);
 const clone = n => JSON.parse(JSON.stringify(n));
 
 // Depth-first walk yielding { disp, path, node, depth }.
@@ -375,6 +382,7 @@ commands.file = ctx => {
     else if (!n.d) d = 'empty';
     else if (n.d.startsWith('\x7fELF')) d = 'ELF 64-bit LSB pie executable, x86-64, dynamically linked, stripped';
     else if (n.d.startsWith('SIMTAR1\n')) d = 'POSIX tar archive (GNU)';
+    else if (n.d.startsWith('\x1f\x8b')) { const nm = n.d.slice(4, Math.max(4, n.d.indexOf('\x00'))); d = `gzip compressed data${nm ? `, was "${nm}"` : ''}, from Unix`; }
     else if (n.d.startsWith('#!')) d = 'Bourne-Again shell script, ASCII text executable';
     else if (/^\s*<(!doctype|html)/i.test(n.d)) d = 'HTML document, ASCII text';
     else if (/[^\x00-\x7f]/.test(n.d)) d = 'Unicode text, UTF-8 text';
@@ -610,6 +618,13 @@ commands.tar = ctx => {
     if (!raw.startsWith('SIMTAR1\n')) { ctx.err('tar: This does not look like a tar archive\ntar: Exiting with failure status due to previous errors\n'); return 2; }
     entries = JSON.parse(raw.slice(8));
   } catch (e) { ctx.err(`tar: ${archive}: Cannot open: ${e.message}\n`); return 2; }
+  // The archive is a plain file the user can edit, so treat every entry as untrusted.
+  const valid = e => e && typeof e === 'object' && typeof e.p === 'string' && e.p && ['f', 'd', 'l'].includes(e.t)
+    && (e.t !== 'f' || typeof e.d === 'string') && (e.t !== 'l' || typeof e.to === 'string');
+  if (!Array.isArray(entries) || !entries.every(valid)) {
+    ctx.err('tar: Archive is corrupt\ntar: Exiting with failure status due to previous errors\n');
+    return 2;
+  }
   for (const e of entries) {
     if (flags.includes('t') || v) ctx.out(e.p + (e.t === 'd' ? '/' : '') + '\n');
     if (!flags.includes('x')) continue;
@@ -617,7 +632,12 @@ commands.tar = ctx => {
     try {
       if (e.t === 'd') { if (!ctx.fs.tryLookup(p)) ctx.fs.mkdir(p); }
       else if (e.t === 'l') ctx.fs.put(p, ctx.fs.node('l', { to: e.to }, 0o777));
-      else { ctx.fs.writeFile(p, e.d); ctx.fs.lookup(p).m = e.m; }
+      else {
+        ctx.fs.writeFile(p, e.d);
+        // Like real tar: restore permission bits only on files we own, never setuid bits.
+        const n = ctx.fs.lookup(p);
+        if (Number.isInteger(e.m) && (n.o === ctx.fs.user || ctx.fs.user === 'root')) n.m = e.m & 0o777;
+      }
     } catch (er) { ctx.err(`tar: ${e.p}: Cannot open: ${er.message}\n`); ctx.fail = 1; }
   }
   return ctx.fail ? 2 : 0;
@@ -671,10 +691,13 @@ commands.printf = ctx => {
 };
 
 commands.grep = commands.egrep = commands.fgrep = ctx => {
-  const { o, rest } = opts(ctx, 'ivnclrRwoEFqHhs', 'e', {
+  const { o, rest } = opts(ctx, 'ivnclrRwoEFqHhs', 'eABC', {
     '--color': '_', '--ignore-case': 'i', '--invert-match': 'v', '--line-number': 'n', '--count': 'c',
     '--recursive': 'r', '--extended-regexp': 'E', '--fixed-strings': 'F', '--quiet': 'q',
+    '--after-context': 'A', '--before-context': 'B', '--context': 'C',
   });
+  const ctxN = v => { const n = parseInt(v ?? '0'); if (!(n >= 0)) throw new Usage(`${v}: invalid context length argument`); return n; };
+  const after = ctxN(o.A ?? o.C), before = ctxN(o.B ?? o.C);
   if (ctx.name === 'egrep') o.E = true;
   if (ctx.name === 'fgrep') o.F = true;
   let pat = o.e;
@@ -712,13 +735,34 @@ commands.grep = commands.egrep = commands.fgrep = ctx => {
   let any = false;
   for (const f of inputs) {
     let count = 0;
-    const prefix = showName ? (col ? `${C.magenta}${f.name}${C.r}${C.cyan}:${C.r}` : f.name + ':') : '';
-    lines(f.text).forEach((line, idx) => {
+    const sepd = ch => (col ? `${C.cyan}${ch}${C.r}` : ch);
+    const prefix = showName ? (col ? `${C.magenta}${f.name}${C.r}` : f.name) + sepd(':') : '';
+    // Context lines (-A/-B/-C) use "-" instead of ":" and groups are separated by "--".
+    const all = lines(f.text);
+    let lastOut = -1, pending = 0;
+    const ctxLine = k => {
+      const pre = showName ? (col ? `${C.magenta}${f.name}${C.r}` : f.name) + sepd('-') : '';
+      const nm = o.n ? (col ? `${C.green}${k + 1}${C.r}` : `${k + 1}`) + sepd('-') : '';
+      ctx.out(pre + nm + all[k] + '\n');
+      lastOut = k;
+    };
+    const gap = first => { if (lastOut >= 0 && first > lastOut + 1) ctx.out(sepd('--') + '\n'); };
+    all.forEach((line, idx) => {
       re.lastIndex = 0;
       const hit = re.test(line) !== !!o.v;
-      if (!hit) return;
+      if (!hit) {
+        if (pending > 0 && !(o.c || o.l || o.q)) { ctxLine(idx); pending--; }
+        return;
+      }
       count++; any = true;
       if (o.c || o.l || o.q) return;
+      if (after || before) {
+        const from = Math.max(lastOut + 1, idx - before);
+        gap(from);
+        for (let k = from; k < idx; k++) ctxLine(k);
+        lastOut = idx;
+        pending = after;
+      }
       const num = o.n ? (col ? `${C.green}${idx + 1}${C.r}${C.cyan}:${C.r}` : `${idx + 1}:`) : '';
       if (o.o && !o.v) {
         re.lastIndex = 0;
@@ -1208,7 +1252,7 @@ commands.uname = ctx => {
 
 commands.date = ctx => {
   const d = new Date();
-  const tz = /\(([^)]+)\)/.exec(d.toString())?.[1].replace(/[a-z ]/g, '') || 'UTC';
+  const tz = tzAbbr(d);
   const fmtArg = ctx.args.find(a => a[0] === '+');
   if (!fmtArg) {
     ctx.out(`${DAY[d.getDay()]} ${MON[d.getMonth()]} ${pad(d.getDate(), 2, ' ')} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())} ${tz} ${d.getFullYear()}\n`);
